@@ -18,6 +18,18 @@
 /** 认得的、算「主人说的」的几种角色写法。 */
 const OWNER_ROLES = new Set(['user', 'human', 'owner']);
 
+/**
+ * 这些 `source.kind` 一定不是主人说的：系统注入、工具结果、调度提醒、别的 agent。
+ * 小乔实测：宿主把 AGENTS.md 标成 `role:'user'` + `source.kind:'agent-instructions'`，
+ * 10960 字整份灌进火炉。所以这张表必须有。
+ */
+const SYSTEM_SOURCE_KINDS = new Set([
+  'agent-instructions', 'system-prompt', 'system_prompt', 'system', 'developer',
+  'context', 'memory', 'skill', 'skills', 'reminder', 'reminders', 'resume',
+  'wake', 'wake-exit', 'tool', 'tool-result', 'tool_result', 'tool-use', 'tool-call',
+  'cluster', 'subagent', 'task',
+]);
+
 /** 认不出的、一律不收。宁可漏记，不要灌垃圾。 */
 const NEVER = new Set(['assistant', 'agent', 'bot', 'tool', 'system', 'function', 'developer']);
 
@@ -49,10 +61,28 @@ function roleOf(msg) {
  *   ② 不是她自己说的（assistant / agent / bot 一律不收）
  *   ③ 不是工具结果、不是系统注入
  *
+ * ★ 2026-10-27 补 ③ 的实现。小乔实测出来的：
+ *
+ *   宿主的系统提示（AGENTS.md、人格段）也是 `role: 'user'` + `source.kind: 'agent-instructions'`。
+ *   而 `roleOf` 先看 role、再看 source.kind —— role 一命中就直接放行了，
+ *   于是**整份 10960 字的系统提示被当成主人经历过的事，送进了火炉**。
+ *
+ *   实测那一轮的 ownerCount=5、材料 13888 字，其中 10960 字是系统注入；
+ *   主人真说的话只有 112 + 262 字。
+ *
+ *   注释里写着「不是系统注入」，但**代码里没有这一条判据**——
+ *   这已经是这个项目里第六次「写完了没接上」了。
+ *
  * @param {object} msg 宿主的消息对象
  * @returns {{ok:boolean, text:string, why:string}}
  */
 export function checkMessage(msg) {
+  // ③ 先查来源：系统注入 / 工具结果 / 调度提醒，都不是主人的经历。
+  //    用**拒绝表**而不是白名单：宁可漏记不确定的，也不能把整份系统提示灌进去。
+  const srcKind = String(msg?.source?.kind ?? '').toLowerCase();
+  if (srcKind && SYSTEM_SOURCE_KINDS.has(srcKind)) {
+    return { ok: false, text: '', why: `system_source:${srcKind}` };
+  }
   const role = roleOf(msg);
   if (!role) return { ok: false, text: '', why: 'unknown_role' };
   if (NEVER.has(role)) return { ok: false, text: '', why: `never:${role}` };

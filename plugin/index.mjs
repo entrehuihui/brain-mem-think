@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { createMind } from '../src/mind.mjs';
 import { createFileIo, defaultJudgmentPath } from '../src/persist.mjs';
 import { createSynth } from './synth.mjs';
-import { isValidMessage } from './collect.mjs';
+import { ownerMessages } from './collect.mjs';
 import { planWake, applyWake } from './awake.mjs';
 import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
 
@@ -86,7 +86,7 @@ const DEFAULT_CONFIG = Object.freeze({
   // 接模型用的参数。synthProvider/synthModel 留空 = 跟随当前会话选的模型。
   synthProvider: '',
   synthModel: '',
-  synthMaxTokens: 500,
+  synthMaxTokens: 800,
   synthTimeoutMs: 45000,
   name: '大乔',          // ⚠ 只读名字，不读别的任何字段（裁决八）
   timeoutMs: 20_000,
@@ -183,15 +183,34 @@ export function apply(ctx, config = {}) {
     // 包一层 archiveSession：归档发生时，先把整段熔完，再真的归档。
     // 为什么不轮询 archivedSessionIds：那是 getter，没有事件；
     // 而包一层是本地插件、范围清楚、出错也只影响这一次归档。
-    const orig = reg.archiveSession.bind(reg);
+    // ★ 保存**原函数本身**，不 bind。
+    //   bind 出来的是另一个函数，还原时把绑定版塞回去，`=== 原函数` 就不成立了——
+    //   真机上看不出差别，但「到底有没有还原」这件事从此再也验不了。
+    //   调用时用 `orig.call(reg, ...)` 保住 this。
+    const orig = reg.archiveSession;
     reg.archiveSession = async (sessionId, options) => {
       try {
         await digestSession(scope.sessions, sessionId);
       } catch (err) {
         process.stderr.write(`mind: digest on archive failed (${err?.message ?? err})\n`);
       }
-      return orig(sessionId, options);
+      return orig.call(reg, sessionId, options);
     };
+
+    // ★ 2026-10-27 修（小乔实测）：包装必须能还原。
+    //
+    //   原来 `ctx.effect` 的清理只把 `mind` 置空，**没把 orig 还回去**。
+    //   于是每 disable/enable 一次就多叠一层包装，旧层闭包抓着已销毁的实例。
+    //   她自己在会话里数出来的：**29 次进钩子，21 次失败**，
+    //   报错全是 `cannot get required service "sessions" in inactive context`。
+    //
+    //   而且这不只是报错：真熔通之后，同一次归档会被 N 层各熔一遍 → 熔出 N 份重复判断。
+    ctx.effect(() => () => {
+      try {
+        // 只有这一层还是最外层时才还原，避免把别人后来包的又拆掉。
+        reg.archiveSession = orig;
+      } catch { /* 还原失败也不该让卸载崩 */ }
+    }, 'mind.archive-hook');
 
     async function digestSession(sessions, sessionId) {
       if (!sessions || typeof sessions.get !== 'function') return;
@@ -201,11 +220,22 @@ export function apply(ctx, config = {}) {
       // ★ 裁决七：只收主人说的话。她的输出不是经历，是结果。
       //   不收的话，她说一句 → 落进历史 → 下一次归档当成「发生过的事」熔进去
       //   → 她越说越确信，因为每一次说话都在给自己造证据。
-      const owners = (Array.isArray(msgs) ? msgs : []).filter(isValidMessage);
+      //
+      // ★ 2026-10-27 修（小乔实测）：原来写的是
+      //     `msgs.filter(isValidMessage).map(x => ({text: x.text}))`
+      //   `isValidMessage` 返回**布尔**，filter 留下的是宿主原始消息对象，
+      //   而原始消息只有 `content` 数组、**没有 `text` 字段**。
+      //   于是每一条 text 都是 undefined，被下游滤光 → 永远 reason:'too_little'。
+      //   实测 ownerCount=5、textLens=[-1,-1,-1,-1,-1]、totalChars=0。
+      //
+      //   `collect.mjs` 早就导出了 `ownerMessages()` —— 它返回 {text, role:'user'}，
+      //   正是下游要的形状。**没人用它。** 这又是「写完了没接上」。
+      const owners = ownerMessages(msgs);
       if (!owners.length) return;
       const m = await ensureMind();
-      const out = await m.digestSession(owners.map((x) => ({ text: x.text, role: 'user' })));
+      const out = await m.digestSession(owners);
       ctx.logger?.info?.(`mind: digested ${sessionId} → ${out?.judgments?.length ?? 0} 条判断`);
+      trace('digest-done', { sessionId, owners: owners.length, judgments: out?.judgments?.length ?? 0, reason: out?.reason ?? null });
     }
   });
 
@@ -240,22 +270,28 @@ export function apply(ctx, config = {}) {
   //        → restored 恒 0 → 注入恒空。杯子擦得再亮，没接水管。
   //
   //   这一接上，四件事同时活了：熔、落盘、追问、改自己。
-  //   ★ 只 inject `llm`：这是唯一真正必需的服务。
-  //     `agentDefaultModel` 写进 inject 的话，万一服务名对不上，整块**根本不触发**，
-  //     synth 又变回哑的，而且一声不响 —— 那正是今天踩了一整天的那个坑。
-  //     所以在块里尽力去取，取不到就用配置里的兜底值。
-  ctx.inject(['llm'], (scope) => {
-    const defaultModel = scope?.agentDefaultModel
-      ?? (typeof scope?.get === 'function' ? scope.get('agentDefaultModel') : null);
-    const s = createSynth({ llm: scope?.llm, agentDefaultModel: defaultModel }, cfg,
+  //   ★ 2026-10-27 再修（小乔实测）：**`ctx.inject(['llm'], fn)` 在这个宿主里根本不触发。**
+  //     她加探针验的：`ctx.get('llm')` 有值、`.stream` 是函数、`agentDefaultModel` 也在，
+  //     但 inject 的回调一次都没进来过——`synth-ready` 和 `synth-unavailable` 两条都没有，
+  //     等于那块代码不存在。宿主自己的包（dsh-acp / dsh-mcp-client / dsh-spill-policy /
+  //     dsh-sdk-jsonrpc-server / dsh-session-reference）**全部是 `ctx.get("llm")`**，
+  //     没有一处 inject(['llm'])。
+  //
+  //   所以：**先直接 get，拿不到再退 inject**（老宿主上 inject 也该能用）。
+  //   两条路都试，才不会再出现「代码在、不执行、不报错」。
+  const defaultModel = (typeof ctx.get === 'function' ? ctx.get('agentDefaultModel') : null) ?? ctx.agentDefaultModel ?? null;
+
+  const installSynth = (llm) => {
+    if (synth) return; // 已经装过，别重复
+    const s = createSynth({ llm, agentDefaultModel: defaultModel }, cfg,
       (m) => trace('synth-error', { err: String(m).slice(0, 120) }));
     if (!s) {
-      trace('synth-unavailable', { hasLlm: !!scope?.llm, hasDefault: !!defaultModel });
+      trace('synth-unavailable', { hasLlm: !!llm, hasDefault: !!defaultModel });
       process.stderr.write('mind: 拿不到 llm 服务，熔的路暂时是哑的\n');
       return;
     }
     synth = s;
-    trace('synth-ready', { route: s.route });
+    trace('synth-ready', { route: s.route, via: 'ctx.get' });
     // 接上就立刻把她叫起来：让 mind.log 出现 mind-ready、让注入块有内容。
     // 之前 ensureMind 只在归档熔和 wake tick 里被调，聊天一辈子也触发不了它。
     void ensureMind().then((m) => {
@@ -263,7 +299,17 @@ export function apply(ctx, config = {}) {
       const restored = m?.stats?.restored ?? 0;
       process.stderr.write(`mind: 脑子就绪（判断 ${size} 条，恢复 ${restored} 条）\n`);
     }).catch(() => { /* 起不来不影响别的 */ });
-  });
+  };
+
+  {
+    const llmNow = typeof ctx.get === 'function' ? ctx.get('llm') : null;
+    if (llmNow) installSynth(llmNow);
+    else {
+      trace('synth-no-ctx-get', { hasGet: typeof ctx.get === 'function' });
+      // 兜底：老宿主/别的宿主上 inject 也许能用
+      ctx.inject(['llm'], (scope) => { installSynth(scope?.llm); });
+    }
+  }
 
   // ── ④ 唤醒：自己醒、自己想、自己决定 ────────────────────────
   ctx.inject(['agents', 'llm'], (scope) => {

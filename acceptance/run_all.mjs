@@ -53,6 +53,7 @@ const SUITE = [
   { key: 'p', file: 'acceptance/p_plugin_shell.mjs', title: '插件壳（唯一出口·六步契约·坏账本往不说倒）' },
   { key: 'q', file: 'acceptance/q_persistence.mjs', title: '落盘（跨重启她还在·原文仍不入库）' },
   { key: 's', file: 'acceptance/r_synth_wiring.mjs', title: '接线（模型真被问到·熔的路真的通）' },
+  { key: 't', file: 'acceptance/t_collect_hook.mjs', title: '采集与钩子（系统注入不收·钩子可还原不叠层）' },
   // 裁决七：她的话不是经历（四块各自独立，不许合并看）
   { key: 'h', file: 'acceptance/h_digest_whitelist.mjs', title: '唤醒①·她的话不是经历（归档熔白名单）' },
   { key: 'i', file: 'acceptance/i_single_exit.mjs', title: '唤醒②·只有一条出口（followup 一处、无 steer/send）' },
