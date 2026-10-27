@@ -62,6 +62,7 @@ export function beliefToJson(b) {
 /** 存一个「有没有变」的指纹：用来避免每次 tick 都写盘。 */
 export function fingerPrint(store) {
   const h = createHash('sha1');
+  h.update(`seed:${Number(store?.seed ?? 0)}\n`);
   for (const b of store?.list ?? []) {
     h.update(`${b.id}|${b.status}|${b.text}|${b.weight}|${b.updatedAt}|${b.curiosityFired}|${b.fuseCount}\n`);
   }
@@ -96,7 +97,7 @@ export function createFileIo(path) {
       }
       if (!obj || obj.version !== PERSIST_VERSION || !Array.isArray(obj.list)) return null;
       lastFp = obj.fp ?? null;
-      return { list: obj.list, absorbed: obj.absorbed ?? {} };
+      return { list: obj.list, absorbed: obj.absorbed ?? {}, seed: Number(obj.seed ?? 0) };
     },
 
     /**
@@ -112,6 +113,10 @@ export function createFileIo(path) {
           version: PERSIST_VERSION,
           savedAt: Date.now(),
           fp,
+          // ★ seed 必须一起存。重启后 seed 从 0 开始，而 lastFired 还是旧值，
+          //   curiosity 那句 `seed - lastFired <= cooldownBeats` 会恒成立 →
+          //   **她再也不会追问同一个悬案**，而且一声不响。
+          seed: Number(store?.seed ?? 0),
           count: (store?.list ?? []).length,
           list: (store?.list ?? []).map(beliefToJson),
           absorbed: store?.absorbed ?? {},

@@ -120,6 +120,10 @@ export class Mind {
             this.store.add(b);
           }
           if (saved.absorbed && typeof saved.absorbed === 'object') this.store.absorbed = saved.absorbed;
+          // ★ seed 要接着上次的往下数。归零会让 curiosity 的冷却判据
+          //   `seed - lastFired <= cooldownBeats` 恒成立（负数永远小于正数），
+          //   **她重启之后就再也不会追问同一个悬案**，而且不报错、看不出来。
+          this.seed = Math.max(Number(saved.seed ?? 0), ...this.store.list.map((b) => Number(b.lastFired ?? 0)), 0);
           this.stats.restored = this.store.list.length;
         }
       } catch { /* 读不回来就当新装，绝不因此起不来 */ }
@@ -129,6 +133,8 @@ export class Mind {
   /** 把当前判断库写回盘。没注入 io 就是空操作。 */
   persist() {
     if (!this.io || typeof this.io.save !== 'function') return false;
+    // 让 store 带上 seed —— io 只拿到 store，seed 得跟着一起走。
+    this.store.seed = this.seed;
     try { return this.io.save(this.store) === true; } catch { return false; }
   }
 

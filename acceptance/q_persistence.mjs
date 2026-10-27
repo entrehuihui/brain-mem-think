@@ -68,6 +68,13 @@ try {
     ok('Q2.has_judgments', Array.isArray(parsed.list) && parsed.list.length === n,
       `盘上 ${parsed.list?.length ?? 0} 条 / 内存 ${n} 条`);
 
+    // ★ seed 一定要写进盘。
+    //   它是 curiosity 冷却的刻度：`seed - lastFired <= cooldownBeats`。
+    //   重启后 seed 若归零、lastFired 还是旧值，差是负数，恒 ≤ 阈值 →
+    //   **她再也不会追问同一个悬案**，而且不报错、界面上看不出来。
+    ok('Q2b.seed_on_disk', Number(parsed.seed ?? 0) >= INPUTS.length,
+      `盘上 seed=${parsed.seed}（喂了 ${INPUTS.length} 条，seed 至少该到这么多）`);
+
     // ③ 铁律：盘上不许有输入原文
     let worst = 0; let worstSample = '';
     for (const src of INPUTS) {
@@ -98,6 +105,22 @@ try {
     // 她在新实例里还能继续说话
     const world = m2.world();
     ok('Q8.world_not_empty', world.includes('我是大乔'), `world: ${world.slice(0, 40).replace(/\n/g, ' ')}`);
+
+    // ★ seed 必须接着上次的数往下走。
+    //   归零会让 curiosity 的冷却判据 `seed - lastFired <= cooldownBeats` 恒成立
+    //   （负数永远小于正数）→ 她重启之后再也不会追问同一个悬案，而且不报错、看不出来。
+    const maxFired = Math.max(0, ...(snap.notes ?? []).map((n) => Number(n.lastFired ?? 0)));
+    ok('Q8b.seed_survives', (m2.seed ?? 0) >= maxFired,
+      `恢复后 seed=${m2.seed} / 最大 lastFired=${maxFired}（seed 必须 ≥ 它）`);
+
+    // 负控制：真喂几条相关的，冷却不该把她锁死
+    {
+      const before = (m2.snapshot().notes ?? [])[0]?.curiosityFired ?? 0;
+      for (let i = 0; i < 3; i += 1) await m2.ingest(INPUTS[i % INPUTS.length]);
+      const after = (m2.snapshot().notes ?? [])[0]?.curiosityFired ?? 0;
+      ok('Q8c.not_permanently_cooled', after >= before,
+        `重启后追问计数 ${before} → ${after}（不该卡死不动）`);
+    }
   }
 
   console.log('\n【三】负控制：不注入 io 时必须是纯内存（不许偷偷写盘）');
