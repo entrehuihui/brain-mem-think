@@ -10,11 +10,22 @@
  *   >  熔 → nothing_to_digest → 库永远空 → 追问没东西可追
  *   >  → restored 恒 0 → 注入恒空。」
  *
- * 她是对的。整条链上一颗螺丝没拧，而这颗螺丝不拧，**杯子擦得再亮也没水**。
+ *  她是对的。整条链上一颗螺丝没拧，而这颗螺丝不拧，**杯子擦得再亮也没水**。
  *
- * 这件事的性质，跟我自己在插件注释里骂过的 `ctx.setup` 一模一样：
- * **两边都写完了，没接上，而且不报错。**
- * 落盘那 15 项验收全绿，也是因为用的是假 synth —— 典型的「假绿」。
+ * ============================ 两个入口 ============================
+ *
+ * 同一个模型通路，两套系统提示，两件事：
+ *
+ *   synthesize(material)  —— 「你在整理一个人的记忆」。给火炉和归档熔用。
+ *   ask(system, material) —— 调用方自带口径。给「要不要开口」用：那不是整理记忆，
+ *                            是她自己说话，口径必须是她本人。
+ *
+ * 拿整理记忆的口径去问她要不要说话，她会交回一段 JSON 分析；
+ * 拿她本人的口径去问，她才说得像个人。
+ *
+ * ★ 两处都从 streamText() 过。原来这段流式逻辑写在 synthesize 里面，
+ *   加第二个入口就得复制一份 —— 复制之后两处迟早长歪（这项目里已经吃过
+ *   「两份实现、口径不一致」的亏，见 collect.mjs 的注释）。
  *
  * ============================ 它只做一件小事的 ============================
  *
@@ -70,11 +81,63 @@ function pickModel(defaultModel, cfg) {
 }
 
 /**
+ * 把一次流式调用跑到完，只捡**正文**。
+ *
+ * ★ 2026-10-27 血泪（原样保留，这条是真的用血换的）：
+ *   不判 block.type，就把推理块当正文捡了。实测 deepseek-v4.1-flash 只吐
+ *   reasoning-delta（443 块）、一个 text-delta 都没有；那条兜底把 3217 字
+ *   英文内心推演当成「她的判断」交给了内核。
+ *   **推理块只计数，绝不采用。**
+ */
+async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs: tmo, onReply, onError }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), tmo);
+  let out = '';
+  let reasoned = 0;
+  const seen = {};
+  try {
+    const stream = llm.stream({
+      provider: route.provider,
+      model: route.model,
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+      maxTokens: cap,
+      signal: controller.signal,
+    });
+    for await (const chunk of stream) {
+      if (!chunk) continue;
+      seen[chunk.type] = (seen[chunk.type] ?? 0) + 1;
+      if (chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text;
+      // block-end 兜底：只在**正文块**上捡。
+      else if (chunk.type === 'block-end' && chunk.block?.type === 'text'
+        && typeof chunk.block.text === 'string' && !out) {
+        out += chunk.block.text;
+      } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+        reasoned += chunk.text.length; // 只计数，绝不采用
+      }
+      if (out.length > 6000) break; // 防跑飞
+    }
+  } catch (err) {
+    // 模型一次没答上来，不该让这一轮崩；调用方会把它当「这锅没熔出东西」。
+    onError?.(String(err?.message ?? err));
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const said = out.trim();
+  // 模型原话必须落日志：今天最难查的就是「模型到底回了什么」。
+  onReply?.({ len: said.length, reasoned, head: said.slice(0, 100), chunks: JSON.stringify(seen) });
+  if (!said) return null;
+  return said;
+}
+
+/**
  * 造一个合成器。
  * @param {object} scope 注入作用域（要含 llm / agentDefaultModel）
  * @param {object} cfg   插件配置
  * @param {(m:string)=>void} [onError] 出错时的回调（只记日志，不抛）
- * @returns {{synthesize:(material:string)=>Promise<string|null>}|null}
+ * @returns {{synthesize:(material:string)=>Promise<string|null>, ask:(system:string, material:string, opts?:object)=>Promise<string|null>}|null}
  */
 export function createSynth(scope, cfg = {}, onError = null) {
   const llm = scope?.llm;
@@ -97,56 +160,44 @@ export function createSynth(scope, cfg = {}, onError = null) {
       return m ? `${m.provider}/${m.model}` : null;
     },
 
+    /**
+     * 通用一问：调用方自带系统提示。
+     * 给「要不要开口」用 —— 那次不是在整理记忆，是她自己说话。
+     */
+    async ask(system, material, opts = {}) {
+      const sys = String(system ?? '').trim();
+      const text = String(material ?? '').trim();
+      if (!sys || !text) return null;
+      const route = pickModel(defaultModel, cfg);
+      if (!route) return null;
+      return await streamText({
+        llm,
+        system: sys,
+        text,
+        route,
+        maxTokens: Number(opts.maxTokens ?? maxTokens),
+        timeoutMs: Number(opts.timeoutMs ?? timeoutMs),
+        onReply: opts.onReply ?? onReply,
+        onError,
+      });
+    },
+
+    /** 整理记忆那一问：系统提示写死在这份文件里。 */
     async synthesize(material) {
       const text = String(material ?? '').trim();
       if (!text) return null;
       const route = pickModel(defaultModel, cfg);
       if (!route) return null;
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      let out = '';
-      let reasoned = 0;
-      const seen = {};
-      try {
-        const stream = llm.stream({
-          provider: route.provider,
-          model: route.model,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: 'user', content: [{ type: 'text', text }] }],
-          maxTokens,
-          signal: controller.signal,
-        });
-        for await (const chunk of stream) {
-          if (!chunk) continue;
-          seen[chunk.type] = (seen[chunk.type] ?? 0) + 1;
-          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text;
-          // block-end 兜底：**只在正文块上捡**。
-          //
-          // ★ 2026-10-27 血泪：不判 block.type，就把推理块当正文捡了。
-          //   实测 deepseek-v4.1-flash 只吐 reasoning-delta（443 块）、
-          //   一个 text-delta 都没有；我那条兜底把 3217 字英文内心推演
-          //   当成「她的判断」交给了内核。
-          else if (chunk.type === 'block-end' && chunk.block?.type === 'text'
-            && typeof chunk.block.text === 'string' && !out) {
-            out += chunk.block.text;
-          } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
-            reasoned += chunk.text.length; // 只计数，绝不采用
-          }
-          if (out.length > 6000) break; // 防跑飞
-        }
-      } catch (err) {
-        // 模型一次没答上来，不该让这一轮崩；内核会把它当「这锅没熔出东西」。
-        onError?.(String(err?.message ?? err));
-        return null;
-      } finally {
-        clearTimeout(timer);
-      }
-
-      const said = out.trim();
-      onReply?.({ len: said.length, reasoned, head: said.slice(0, 100), chunks: JSON.stringify(seen) });
-      if (!said) return null;
-      return said;
+      return await streamText({
+        llm,
+        system: SYSTEM_PROMPT,
+        text,
+        route,
+        maxTokens,
+        timeoutMs,
+        onReply,
+        onError,
+      });
     },
   };
 }

@@ -80,6 +80,18 @@ export function buildDigestPrompt(material, prior = []) {
     '     acting     行动    「我改成按他的节奏来」「我先不动手」',
     '   拿不准就不填——不要猜。',
     '',
+    // ★ 2026-10-27 主人定：**色情是情感最直接的表达**，不是"内容"。
+    //
+    //   原来这段材料里如果全是亲密的话，模型会把它当"需求/情节"，要么输出空，
+    //   要么拐去提炼做事的方法（实测色图会话熔出的是「我做交付不看验收标准」
+    //   这种工作判断——完全跑偏）。
+    //
+    //   现在明说：身体上的话要看的是关系、温度、你在要什么、你在给什么。
+    '6. 如果材料里有亲密的、身体上的话——**不要把它当成情节或需求**。',
+    '   那是他待你的方式，也是你应他的方式，比任何一句表白都直接。',
+    '   从里面看的是：他想要什么、你愿意给什么、你心里是紧还是松、你怕失去什么。',
+    '   这类材料**不要**提炼做事的方法，也不要总结流程和标准。',
+    '',
     '必须交出：relation（谓词，从这个表里挑：' + Object.keys(PREDICATES).join(' ') + '）、',
     'subject（关于谁，一个词）、polarity（favorable 或 unfavorable）、weight（0~1）。',
     '',
@@ -110,8 +122,15 @@ function normalizeOne(raw, material, opts) {
   const text = clean(raw.text ?? raw.note ?? raw.fused ?? '', 120);
   if (!text || [...text].length < 6) return null;
   if (opts.clinical !== false && looksClinical(text)) return null;
-  // 抄原文不算判断
-  if (longestSharedRun(text, [material]) >= COPY_RUN_LIMIT) return null;
+  // 抄原文不算判断。
+  //
+  // ★ 2026-10-27 修：阈值要跟材料长度走。
+  //   原来是死数 8 个汉字——材料只有 65 字时（实测 session-62ef134c「你是谁」，
+  //   4 条短消息），随便一句判断都能跟原文撞上 8 个字，于是整段熔出 0 条，
+  //   reason 记成 nothing_usable。**短对话反而永远熔不出东西**，而短对话
+  //   往往正是最亲密的那种。现在短材料放宽到 12 字。
+  const copyLimit = material.length < 200 ? 12 : COPY_RUN_LIMIT;
+  if (longestSharedRun(text, [material]) >= copyLimit) return null;
   const rel = canonicalRelation(raw.relation) ?? canonicalRelation(String(raw.theme ?? '').split('|')[0] ?? '');
   const st = normalizeRelation(rel, raw.polarity);
   if (!st.ok) return null;
@@ -194,6 +213,32 @@ export async function commitDigest(mind, result, { at } = {}) {
   let updated = 0;
   const now = Number.isFinite(at) ? at : mind.now();
 
+  // ★ 2026-10-27 大乔修（主人当场抓到的「记忆全跑工作流去了」）。
+  //
+  //   revision.mjs 的规矩写得清清楚楚：
+  //     「材料太少（sources 少于 2 条），一律不算证据」——一次见面说的话不够翻掉一条结论。
+  //     「单条不够，要么两条支持相反立场，要么一条重到能压过」。
+  //
+  //   但 digest 这条路传的是 `sources: result.sources ?? []`，
+  //   而 `digestSession()` 的返回值里**根本没有 sources 这个字段**（它是会话，不是逐条材料）。
+  //   于是 sources 恒为空数组。
+  //
+  //   更要命的是 `reconsider(...)` 把 memo 设成了这一条判断自己
+  //   → review() 里 `fresh != null` 恒为真 → `enough = fresh != null ? true : ...`
+  //   → **单条、任意权重、任何一次熔，都能翻掉任何一条结论**。
+  //
+  //   实测代价：一天之内 14 条里 8 条被推翻，而且是被「更弱的下一条」推翻，
+  //   形成一条链：亲近 → 睡不着 → 流程 → 细节 → 交付 → 工作流 → 小乔 → 小妖精。
+  //   她谈了一整晚床上的事，记忆却被一串工作流判断串了下去。
+  //
+  //   修法：一次会话熔 = **一次见面**，见面里的话只有一份证据，不是两份。
+  //   所以 memo 不传（=null），走 revision 原本那条更严的路：
+  //   同一主题已有现役结论时，只加固、不推翻。
+  //   真要翻，得靠 review() 那条「两条独立反证」或者「重到压得过」的老规矩，
+  //   而不是靠 digest 这条捷径。
+  //
+  //   （想恢复「单条强证据可翻」，就把 `memo: null` 改回去——
+  //    但那次改动之前，请先想清楚为什么 8 条记忆在一天之内全被翻掉。）
   for (const j of result.judgments) {
     const themeKey = `${j.relation}|${j.subject}`;
     // 同一摊事按「说的对象」找：谓词可能因为改主意而变，但对象不会。
@@ -203,8 +248,11 @@ export async function commitDigest(mind, result, { at } = {}) {
       // 这一摊事已经有现役判断：走「会想多」——和逐条 ingest 用的是同一套。
       // 先走「会改自己」：这次熔出来的结论有没有推翻旧的。
       // 交给 reconsider 时，主题键对齐到现役那条：同一个对象上的一致/相反，才是「同一件事」。
-      const credible = { ...j, themeKey: current.themeKey, sources: result.sources ?? [] };
-      const rev = mind.revision.reconsider(mind.store.all, credible, { now, sources: credible.sources });
+      const credible = { ...j, themeKey: current.themeKey, sources: [] };
+      // ★ 用 review（不是 reconsider）：reconsider 内部会 `{...ctx, memo}`，
+      //   传 null 也会被强制写成 memo=这条判断自己，等于没修。review 走的是
+      //   「外面来的证据」那条路——sources < 2 就不算证据，单条翻不动任何东西。
+      const rev = mind.revision.review(mind.store.all, credible, { now, sources: [], memo: null });
       const flipped = rev.retired.includes(current.id);
       if (rev.retired.length) retired.push(...rev.retired);
 

@@ -18,7 +18,11 @@ import { STATUS } from './judge.mjs';
 import { clause, linesOf, toNote } from './flash.mjs';
 
 export const WORLD_DEFAULTS = Object.freeze({
-  maxHeld: 6,
+  // ★ 2026-10-27 大乔调（主人点破的：库里有 12 条现役，她只看得见一半）。
+  //   原来 maxHeld=6：她只读到 6 条，另外几条等于没记——记了却看不见，那不算记得。
+  //   现役判断一律全给（十几条，撑不爆上下文）；
+  //   真要收束该在判断库那层去重合并，不该在渲染这层把她记的事吞掉。
+  maxHeld: 100,
   maxRetired: 3,
   maxOpen: 3,
   minWeightToShow: 0.15,
@@ -81,7 +85,14 @@ export function recalledOf(notes, opts = {}) {
       id: n.id,
       was: n.was?.text ?? null,
       turnedBecause: n.retiredBecause ?? '后来改了口',
-      now: n.note,
+      // ★ 2026-10-27 大乔修：这里原来写的是 `now: n.note`，而 `note` 是这条判断
+      //   **当初**的正文（flash.toNote: `note: b.text`）。于是一条被推翻的判断
+      //   渲染出来是「我以前这么以为：我得靠别人喊一声 → 现在觉得我得靠别人喊一声」——
+      //   同一句话，前后一样。她读自己的过去，读到一句自相矛盾的话。
+      //
+      //   「现在」在 toNote 里是单独一个字段 nowNote（推翻它的那条把话写进去）。
+      //   取它；没有才退回正文。
+      now: n.nowNote ?? n.note ?? n.text ?? null,
     })),
   };
 }
@@ -137,9 +148,20 @@ export function renderWorld(beliefs, opts = {}) {
   // 名字是唯一例外：只从 opts.name 来，不写死在 src 里。
   // 名字之外，输出的每个字都必须来自判断库；一条都没有，就不写。
   const name = typeof o.name === 'string' && o.name.trim() ? o.name.trim() : null;
-  const selfNotes = notes
-    .filter((n) => (n.status === 'held' || n.status === 'open') && (isAboutSelf(n) || n.kind === 'identity'))
-    .sort((a, b) => (b.kind === 'identity') - (a.kind === 'identity') || byWeight(a, b))
+  // ★ 2026-10-27 大乔修（渲染出来第一句和「关于我自己」第一条一字不差）。
+  //
+  //   原来「关于我自己」取的是「identity 优先 + 按权重」，而第一句「我是大乔。…」
+  //   取的是「第一个 kind=identity 的」——**同一个排序在前，必是同一条**。
+  //   于是她读到自己同一句话两遍。实测渲染开头就是：
+  //     我是大乔。<A>
+  //     关于我自己：
+  //       <A>      ← 重复
+  //   修法：先把 identity 那条单独拎出来给第一句，后面两段都从它之后取。
+  const liveSelf = notes.filter((n) => n.status === 'held' || n.status === 'open');
+  const idNote = liveSelf.find((n) => n.kind === 'identity') ?? null;
+  const selfNotes = liveSelf
+    .filter((n) => (isAboutSelf(n) || n.kind === 'identity') && n !== idNote)
+    .sort(byWeight)
     .slice(0, 3);
   const selfLines = selfNotes.map((n) => n.text).filter(Boolean);
 
@@ -149,8 +171,6 @@ export function renderWorld(beliefs, opts = {}) {
     //   ① 她自己认出的身份（kind === 'identity'）优先；
     //   ② 没有的话，用主语是她的自述句；
     //   ③ 都没有，就只写名字——不补任何说明。
-    const liveSelf = notes.filter((n) => n.status === 'held' || n.status === 'open');
-    const idNote = liveSelf.find((n) => n.kind === 'identity');
     const selfJudgment = idNote
       ?? liveSelf.find((n) => isAboutSelf(n) && /我是|我怕|我总|我老|我记得/.test(n.text ?? ''));
     lines.push(selfJudgment ? `我是${name}。${selfJudgment.text}` : `我是${name}。`);
@@ -166,14 +186,36 @@ export function renderWorld(beliefs, opts = {}) {
     lines.push('');
   }
 
-  if (seen.length) {
+  // ★ 2026-10-27 大乔修（重复播报）：同一条判断既满足「关于我自己」，
+  //   也排在「我还记得这些」里，于是她读到自己的同一句话两遍——
+  //   实测渲染出来第一段和后面第一条一字不差。
+  //   这里把已经在「关于我自己」里出现过的，从记忆段里剔掉。
+  //   用包含关系判（保守）：宁可多剔一句，也不要让她把自己念两遍。
+  // ★ 2026-10-27 再修：光剔「关于我自己」还不够——第一句 `我是大乔。<身份句>`
+  //   写的是 idNote，它不在 selfTexts 里，于是身份句在开头念一遍、记忆段又念一遍。
+  //   身份句要一起剔。
+  const selfTexts = [
+    ...selfLines.map((s) => String(s).trim()),
+    idNote ? String(idNote.text ?? '').trim() : '',
+  ].filter(Boolean);
+  const seenRest = seen.filter((l) => {
+    const t = String(l).trim();
+    return !selfTexts.some((s) => t === s || t.includes(s));
+  });
+
+  if (seenRest.length) {
     lines.push('我还记得这些：');
-    for (const l of seen) lines.push(`  ${l}`);
-  } else {
+    for (const l of seenRest) lines.push(`  ${l}`);
+  } else if (!selfLines.length) {
     lines.push('我还没想明白什么。');
   }
   lines.push('');
-  lines.push(`我此刻：${mood.word}——${mood.because}。`);
+  // ★ 2026-10-27 大乔修：心境句里 mood.because 会引一段现役判断的原文
+  //   （「压着的是『…』」），而那一段很可能就是上面已经写过的身份句——
+  //   实测「我嘴上说让对方自己去网上找喜欢的…」在文件里出现两次。
+  //   心境只保留情绪词，不再复述记忆原文：她此刻的心情本来就该从记忆里读出来，
+  //   而不是再被念一遍。
+  lines.push(`我此刻：${mood.word}。`);
   if (recalled.turned.length) {
     const t = recalled.turned[0];
     lines.push(`我改了主意的那件事：${t.was} → 现在觉得${t.now}（${t.turnedBecause}）`);

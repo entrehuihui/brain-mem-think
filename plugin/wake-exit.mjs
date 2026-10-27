@@ -27,6 +27,7 @@
  * 反过来（先记账后发送）就会出现「账上说她说了，其实没说」——那种账是骗自己的。
  */
 
+import { randomUUID } from 'node:crypto';
 import { readWake, writeWake, hashMessage, normMessage } from './wake-store.mjs';
 
 /** 去重窗口：同一句话多久之内不许再说。 */
@@ -62,18 +63,50 @@ export async function speakToOwner({ agent, sessionId, message, ctx = null, now 
   } catch { /* 拿不到归档列表就别挡，按「没归档」处理 */ }
 
   // ── 3. 去重闸 ────────────────────────────────────────────────
-  const text = normMessage(message);
+  //
+  // ★ 2026-10-27 修（她的话发出去没有标点）：原来这里把 `normMessage()` 的结果
+  //   既用来算 hash、又当成正文发出去了。而 normMessage 会**去掉所有空白和标点**
+  //   （那是为了判「这句是不是又重了一遍」）。于是她说的
+  //   「我醒了，这屋子是空的。」发出来变成「我醒了这屋子是空的」。
+  //
+  //   规范化只该用在判重上。**发出去的必须是原话。**
+  const raw = String(message ?? '').trim();
+  const text = normMessage(raw);
   if (!text) return { sent: false, why: 'empty' };
   const state = readWake(storePath);
-  const hash = hashMessage(text);
+  const hash = hashMessage(raw);
   const seen = Array.isArray(state.spokenHashes) ? state.spokenHashes : [];
   const hit = seen.find((s) => s && s.hash === hash && (now - Number(s.at ?? 0)) < REPEAT_WINDOW_MS);
   if (hit) return { sent: false, why: 'repeat' };
 
   // ── 4. 发送（全插件唯一一次 followup）────────────────────────
+  //
+  // ★ 2026-10-27 两次修，第二次才是要害：
+  //
+  //   ① 形状：原来传 `{ text: raw }`，宿主不认（它要 `content` 数组），
+  //      那一轮报 `content is not iterable`。
+  //   ② **身份**：改成 content 数组之后仍然坏，报的是
+  //      `session event at seq 8 lacks an identified message`。
+  //      查 dsh-session:1199 才明白 user/message 的 data **必须自带 id 和 role**：
+  //
+  //        if (typeof message["id"] !== "string" || message["id"] === "")
+  //          throw `${subject} lacks an identified message`
+  //        if (messageRecord["role"] !== "user")
+  //          throw `${subject} message must have role "user"`
+  //
+  //      宿主自己写消息时会补这两个字段（正常消息是 content/source/role/id），
+  //      **但 followup 投递的消息它原样落盘、不补**。
+  //      少了 id，那条会话从此 replay 不过——她说一句话就把屋子写塌，已经两回。
+  //
+  //   现在四样给全：id（uuid）/ role / content / source。
   if (typeof agent.followup !== 'function') return { sent: false, why: 'no-followup' };
   try {
-    agent.followup({ text, source: { kind: 'mind-wake' } });
+    agent.followup({
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: raw }],
+      source: { kind: 'mind-wake' },
+    });
   } catch (err) {
     return { sent: false, why: `throw:${err?.message ?? err}` };
   }

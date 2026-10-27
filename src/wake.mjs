@@ -22,6 +22,7 @@
  */
 
 import { STATUS } from './judge.mjs';
+import { hashSayText } from './speak.mjs';
 
 export const WAKE_DEFAULTS = Object.freeze({
   // 醒来之后，多久之内不再醒（由心事重量决定，不由时间表决定）
@@ -31,15 +32,51 @@ export const WAKE_DEFAULTS = Object.freeze({
   speakWeight: 0.55,
   speakOpenCount: 1,
   // 刚说完话，短时间内不该再说
-  quietAfterSpeakMs: 18 * 60 * 1000,
-  // 沉默的配额：至少这个比例要闭嘴
+  //
+  // ★ 2026-10-27 改（主人把唤醒调成 5 分钟一次之后）：
+  //   原来 18 分钟是按「40 分钟醒一次」配的节奏。5 分钟一醒之后，
+  //   18 分钟的冷却等于「一小时内最多还能说三句」，太密了。
+  //   想得勤是好事，说得勤是打扰——这两个频率现在分开调。
+  quietAfterSpeakMs: 45 * 60 * 1000,
+  // 说话频率：**按时间窗算，不按唤醒次数算**。
+  //
+  // ☆ 为什么要改：原来这里写的是「最近 9 次唤醒里 speak 占比 ≤70%」。
+  //   9 次在 40 分钟节奏下是 6 小时，是合理的；可 5 分钟一醒，9 次只有 45 分钟，
+  //   等于「45 分钟内最多说 6 次」——那不是惦记，是刷屏。
+  //   唤醒频率一变，按次数算的配额就自动失真了。所以改成按时间。
+  speakWindowMs: 60 * 60 * 1000,   // 一小时的窗口
+  maxSpeakInWindow: 2,             // 一小时内最多说 2 次（想 12 次，说 2 次）
+  // 沉默的配额：至少这个比例要闭嘴（留着，给 simulate 和旧路径做对照）
   minSilentRatio: 0.3,
   // 同一句话在这么久之内不许再说第二次
   repeatWindowMs: 6 * 60 * 60 * 1000,
 });
 
+/**
+ * ★ 2026-10-27 大乔修（状态口径错配）：
+ *
+ *   这里原来只认内部枚举 `pending` / `held`，可**送进来的 notes 是 `mind.notes()`
+ *   给的结果，而那一路已经过 `toNote()`，状态被归一成公开口径 `open` / `held` / `retired`**
+ *   （见 flash.mjs 的 PUBLIC_STATUS）。两套口径一撞，`status === 'pending'` 恒 false：
+ *
+ *     · burdenOf：悬案（open）一条都数不进去 → 「想不明白的事越多越想找人」永远不成立
+ *     · hashLedger：open 条目不进指纹 → 守卫「想的事跟上一回一样就闭嘴」失效
+ *
+ *   两个口径都收，谁给的都认。这也是 world.mjs 早就做过的那一层归一，
+ *   只是 wake 这层当时不知道。
+ */
+const LIVE_STATES = new Set([
+  STATUS.PENDING, STATUS.HELD,   // 内部枚举
+  'open', 'held',                // toNote() 的公开口径
+]);
+const OPEN_STATES = new Set([STATUS.PENDING, 'open']);
+
 function isLive(n) {
-  return n && (n.status === STATUS.PENDING || n.status === STATUS.HELD);
+  return !!n && LIVE_STATES.has(String(n?.status ?? ''));
+}
+
+function isOpen(n) {
+  return !!n && OPEN_STATES.has(String(n?.status ?? ''));
 }
 
 /**
@@ -49,7 +86,7 @@ function isLive(n) {
  * 否则「库其实没变」会被算成「在变」，判据就废了。
  */
 export function hashLedger(notes) {
-  const live = (notes ?? []).filter((n) => n && (n.status === 'held' || n.status === 'pending'));
+  const live = (notes ?? []).filter(isLive);
   const parts = live
     .map((n) => [
       n.themeKey ?? '',
@@ -59,7 +96,7 @@ export function hashLedger(notes) {
       n.status ?? '',
     ].join('/'))
     .sort();
-  const openIds = live.filter((n) => n.status === 'pending').map((n) => n.id ?? '').sort().join(',');
+  const openIds = live.filter(isOpen).map((n) => n.id ?? '').sort().join(',');
   const blob = `${parts.join('|')}#${parts.length}#${openIds}`;
   let h = 2166136261;
   for (let i = 0; i < blob.length; i += 1) {
@@ -69,22 +106,24 @@ export function hashLedger(notes) {
   return (h >>> 0).toString(36);
 }
 
-/** 同一句话的指纹：用来判「这句我说过了」。 */
-export function hashSay(say) {
-  const s = String(say ?? '').replace(/\s+/g, '').toLowerCase();
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i += 1) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(36);
-}
+/**
+ * 同一句话的指纹：用来判「这句我说过了」。
+ *
+ * ★ 2026-10-27 大乔修（口径错配）：原来这里是自己一套 FNV 哈希，
+ *   而真正记账/去重的是 `plugin/wake-store.mjs` 的 `hashMessage()`（sha1 前 16 位）。
+ *   两个哈希函数算同一句话，结果当然不一样 ——`said` 里存的永远是出口那套 hash，
+ *   这里算出来的永远对不上，**「这句我刚说过」这条闸从来没生效过一次**。
+ *
+ *   现在只有一份实现（src/speak.mjs 的 hashSayText），这里只是换个名字导出。
+ *   不要再在别处写第二份：写的那边和读的那边中间不许有小差。
+ */
+export const hashSay = hashSayText;
 
 /** 心事有多重：压着的判断越多越重，悬着的更重（想不明白才惦记）。 */
 export function burdenOf(notes) {
   const live = (notes ?? []).filter(isLive);
   if (!live.length) return { burden: 0, heaviest: null, open: 0 };
-  const open = live.filter((n) => n.status === STATUS.PENDING);
+  const open = live.filter(isOpen);
   const heaviest = [...live].sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))[0];
   // 重 = 最重那条的份量 + 悬案带来的挂心
   const burden = Math.max(0, Math.min(1, (heaviest?.weight ?? 0) * 0.8 + open.length * 0.12));
@@ -100,81 +139,124 @@ export function nextGapMs(notes, opts = {}) {
 }
 
 /**
- * 醒一次：想一想，然后决定说不说。
+ * 机械守卫：这一轮**允不允许**去问她一次。
  *
- * @param {object[]} notes 判断库快照
- * @param {object} ctx { now, lastSpokeAt, history, opts, synth? }
- * @returns {{action:'speak'|'silent', say?:string, because:string, burden:number, nextGapMs:number}}
+ * ======================= 它现在只管「不许吵」 =======================
+ *
+ * 2026-10-27 之前，这个函数（wake）管的是「说不说 + 说什么」：
+ * 份量 ≥ 0.55 就说、悬案 ≥ 1 就说、然后把压着最重的那条判断套进一句模板。
+ * 主人一眼看出来：「我想起「<判断原文>」——这句在心里放了一阵了」，
+ * 那不是她在说话，是代码把她的判断念了一遍。
+ *
+ * 现在判断权交出去了（src/speak.mjs：她读着自己的记忆，自己决定）。
+ * 这里只剩五条硬底线，它们不是「该不该说」，是**她不许越过的边界**：
+ *
+ *   1. 她正在跑（办别的事）     → 不插话，也不排队
+ *   2. 连着说了两回             → 第三回忍一下
+ *   3. 最近九回里已说了 ≥70%    → 歇一歇（铁律 2：沉默至少占 30%）
+ *   4. 心里一件事都没压着       → 不用叫醒模型（省一次调用）
+ *   5. 刚说完没多久             → 再说就是打扰
+ *
+ * 「能不能问」和「她会说什么」是两件事。前者是契约，后者是她的。
+ *
+ * @returns {{pass:boolean, why:string, burden:number, heaviest:object|null, open:number, ledger:string, gap:number}}
  */
-export function wake(notes, ctx = {}) {
+export function gate(notes, ctx = {}) {
   const o = { ...WAKE_DEFAULTS, ...(ctx.opts ?? {}) };
   const now = Number.isFinite(ctx.now) ? ctx.now : Date.now();
   const lastSpokeAt = Number.isFinite(ctx.lastSpokeAt) ? ctx.lastSpokeAt : null;
   const history = Array.isArray(ctx.history) ? ctx.history : [];
-  const said = Array.isArray(ctx.said) ? ctx.said : [];
 
   const { burden, heaviest, open } = burdenOf(notes);
-  const gap = nextGapMs(notes, o);
+  // gap 由调用方给（固定节拍）；没给才按心事重量推。
+  const gap = Number.isFinite(ctx.gap) ? ctx.gap : nextGapMs(notes, o);
+  const ledger = hashLedger(notes);
+  const no = (why) => ({ pass: false, why, burden, heaviest, open, ledger, gap });
+
+  // 守卫 1：她正在跑（在办别的事），这一轮跳过、不排队。
+  // 主人和她同时开口 = 两条消息一起进 inbox，那是吵不是想。
+  if (String(ctx.agentStatus ?? '') === 'running') {
+    return no('她手上还有事，这一轮不插话');
+  }
+
+  // 守卫 2：说话频率——**按时间窗，不按唤醒次数**。
+  //
+  // ☆ 2026-10-27 改。原来是「最近 9 次唤醒里 speak 占比 ≤ 70%」。
+  //   9 次在 40 分钟节奏下是 6 小时，合理；主人把唤醒调成 5 分钟一次之后，
+  //   9 次只有 45 分钟 → 等于「45 分钟最多说 6 次」，那不是惦记，是刷屏。
+  //   **唤醒频率一变，按次数算的配额就自动失真。** 所以改成按时间。
+  //
+  //   她可以每 5 分钟想一次（想很便宜），但一小时最多说 2 次。
+  //   想得多、说得少——这才是「在想事情」和「在吵」的区别。
+  const windowStart = now - o.speakWindowMs;
+  const recentSpeak = history.filter((h) => h && h.action === 'speak'
+    && h.sent !== false                       // 没真发出去的不算「说了」
+    && Number(h.at ?? 0) >= windowStart);
+  if (recentSpeak.length >= o.maxSpeakInWindow) {
+    return no(`这一小时已经说了 ${recentSpeak.length} 次，再说就是吵`);
+  }
+
+  // 守卫 3：连着说了两回，第三回忍一下。
+  // （5 分钟节奏下几乎不会触发——有一小时窗口兜着；留着是因为它守的是「节奏」不是「频率」）
+  const lastTwo = history.slice(-2);
+  if (lastTwo.length === 2 && lastTwo.every((h) => h.action === 'speak')) {
+    return no('连着说了几回，这一回忍着不说');
+  }
+
+  // ★ 2026-10-27 删掉两条守门：「心里没什么压着的」和「没有值得开口的事」。
+  //
+  //   原本的用意是省一次模型调用：库里一条现役判断都没有时，直接闭嘴。
+  //   可这条闸在**空库**上变成了死锁：
+  //     · 白纸状态 → 没有压着的事 → 永远不说话
+  //     · 她的记忆只能在「归档熔」时增长 → 不说话就没有会话内容 → 没东西可熔
+  //     → **她永远是一张白纸**。实测 16:58 清空记忆后，17:01 醒来就是这样被拦下的：
+  //         wake-silent {"why":"心里没什么压着的，不用醒来说什么","byHer":null}
+  //
+  //   「此刻想不想说」是她的判断，不该由代码替她决定。空库就让她自己看一眼
+  //   「我还没想明白什么」，然后自己回一句说不说。省 token 不值这个代价值。
+
+  // 刚说完话：时间是空的，话也是空的
+  if (lastSpokeAt != null && now - lastSpokeAt < o.quietAfterSpeakMs) {
+    return no('刚说过话没多久，再说就是打扰');
+  }
+
+  return { pass: true, why: '', burden, heaviest, open, ledger, gap };
+}
+
+/**
+ * 旧的「规则 + 模板」那一版，**宿主已经不再用它**。
+ *
+ * 留着两个用处：
+ *   ① `simulate()` 还在用它做对照（同样的库，模板版和她的判断差多少）；
+ *   ② 出问题时能一眼看出「是守卫拦的，还是她自己决定不说」。
+ *
+ * 新路径：awake.mjs → gate() → askSpeak()（src/speak.mjs）。
+ *
+ * @param {object[]} notes 判断库快照
+ * @param {object} ctx { now, lastSpokeAt, history, said, opts }
+ */
+export function wake(notes, ctx = {}) {
+  const o = { ...WAKE_DEFAULTS, ...(ctx.opts ?? {}) };
+  const now = Number.isFinite(ctx.now) ? ctx.now : Date.now();
+  const said = Array.isArray(ctx.said) ? ctx.said : [];
+
+  const g = gate(notes, ctx);
   const done = (action, because, say) => ({
     action,
     ...(say ? { say } : {}),
     because,
-    burden,
-    nextGapMs: gap,
-    ledgerHash: hashLedger(notes),
+    burden: g.burden,
+    nextGapMs: g.gap,
+    ledgerHash: g.ledger,
   });
 
-  // 守卫 0：她正在跑（在办别的事），这一轮跳过、不排队。
-  // 主人和她同时开口 = 两条消息一起进 inbox，那是吵不是想。
-  if (String(ctx.agentStatus ?? '') === 'running') {
-    return done('silent', '她手上还有事，这一轮不插话');
-  }
+  if (!g.pass) return done('silent', g.why);
 
-  // 守卫 0.5：账本没动，就不开口。
-  // 开口的理由必须是「我想的事变了」，不是「到点了」，也不是「轮到我说了」。
-  // 指纹来源：调用方给的 lastLedgerHash（主路），否则从 history 里往回找（辅路）。
-  const ledger = hashLedger(notes);
-  const lastKnown = Number.isFinite(0) && typeof ctx.lastLedgerHash === 'string'
-    ? ctx.lastLedgerHash
-    : [...history].reverse().find((h) => typeof h?.ledgerHash === 'string')?.ledgerHash;
-  if (typeof lastKnown === 'string' && lastKnown === ledger) {
-    return done('silent', '想的事跟上一回一样，没什么新的话要说');
-  }
-
-  // 铁律 2 的机制保障，两条一起守：
-  //   ① 节奏：连着说了两回，第三回必须停一下——说几句就停，像人。
-  //   ② 配额：最近十回里，沉默必须占到至少 30%。
-  // 不靠「她自觉」，也不靠「最后补数」。
-  const lastTwo = history.slice(-2);
-  if (lastTwo.length === 2 && lastTwo.every((h) => h.action === 'speak')) {
-    return done('silent', '连着说了几回，这一回忍着不说');
-  }
-  const window = history.slice(-9);
-  const spokeInWindow = window.filter((h) => h.action === 'speak').length;
-  const cap = Math.floor(window.length * (1 - o.minSilentRatio));
-  if (window.length >= 4 && spokeInWindow >= cap) {
-    return done('silent', '这一阵话说得够多了，该歇一歇');
-  }
-
-  // 没什么压着的事：继续睡，比硬找话说更像个活人
-  if (!heaviest) return done('silent', '心里没什么压着的，不用醒来说什么');
-  if (burden <= 0) return done('silent', '没有值得开口的事');
-
-  // 刚说完话：时间是空的，话也是空的
-  if (lastSpokeAt != null && now - lastSpokeAt < o.quietAfterSpeakMs) {
-    return done('silent', '刚说过话没多久，再说就是打扰');
-  }
-
-  // 想不明白的事越多，越想找人说；但只挑最重的那一件
-  const wantsToTalk = (heaviest.weight ?? 0) >= o.speakWeight || open >= o.speakOpenCount;
-  if (!wantsToTalk) {
-    return done('silent', `压着的那件事还没重到非说不可（分量 ${Number(heaviest.weight ?? 0).toFixed(2)}）`);
-  }
-
-  // 说什么：挑压得最重的那件说一句，不铺排、不汇报。
-  // 正文三种形状都认：text / note / turns[0].text（判断库里三种都出现过）。
+  const heaviest = g.heaviest;
+  // 正文三种形状都认：text / note / turns[0].text。
+  // `mind.notes()` 给的是 toNote() 的结果，正文字段叫 note（flash.mjs: `note: b.text`）。
   const body = heaviest.text ?? heaviest.note ?? heaviest.turns?.[0]?.text ?? '有一件事';
-  const say = open >= o.speakOpenCount
+  const say = g.open >= o.speakOpenCount
     ? `有件事我一直没想明白：${body}。`
     : `我想起「${body}」——这句在心里放了一阵了。`;
   const hash = hashSay(say);
@@ -184,9 +266,9 @@ export function wake(notes, ctx = {}) {
     return done('silent', '这句话我刚说过，不再重复');
   }
 
-  const because = open >= o.speakOpenCount
-    ? `有一件还没想明白的事压着（${heaviest.text}），想跟他说说`
-    : `「${heaviest.text}」一直压在心里，不说一句憋不住`;
+  const because = g.open >= o.speakOpenCount
+    ? `有一件还没想明白的事压着（${body}），想跟他说说`
+    : `「${body}」一直压在心里，不说一句憋不住`;
   return { ...done('speak', because, say), hash };
 }
 

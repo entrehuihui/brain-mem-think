@@ -24,15 +24,19 @@
  * **插件本体照常活着**——绝不能因为少一个服务就让整个 fiber 起不来。
  */
 
-import { readFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { createMind } from '../src/mind.mjs';
 import { createFileIo, defaultJudgmentPath } from '../src/persist.mjs';
 import { createSynth } from './synth.mjs';
 import { ownerMessages } from './collect.mjs';
-import { planWake, applyWake } from './awake.mjs';
+import { planWake, applyWake, resetTalkState } from './awake.mjs';
 import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
+import { installModelSelection } from './selection.mjs';
+import { readCursors, writeCursor, sliceFresh } from './digest-cursor.mjs';
+import { readChannel, writeChannel, defaultChannelPath } from './channel-store.mjs';
 
 export const name = 'mind';
 
@@ -46,11 +50,20 @@ const HERE = dirname(fileURLToPath(import.meta.url));
  *   一个插件只该有一个 .mind。
  */
 const ROOT = dirname(HERE);
-/** 通道会话的固定 id。不许带冒号、空格、路径分隔符——宿主会拿它当文件名。 */
+
+/**
+ * 归档钩子的印章。
+ *
+ * ★ 2026-10-27 加：用来判断「这一层是不是我已经包过的」。
+ *   没有它，每启停一次就多套一层，同一次归档熔五遍（日志里数出来的）。
+ *   用 Symbol.for 而不是模块内常量：宿主重载插件后模块实例可能换一个，
+ *   Symbol.for 走全局注册表，跨实例也认得出同一个章。
+ */
+const ARCHIVE_HOOK = Symbol.for('mind.archiveHook');
 /**
  * 她那条通道的会话 id。
  *
- * ★ 2026-10-27 大乔定：**不要自己造 id，要用宿主建好的那条。**
+ * ★ 2026-10-27 大乔定：**不要自己编 id，格式必须是宿主 mint 的那种。**
  *
  *   踩过的坑（一整天）：我用 `agents.create({ sessionId: 'mind-her' })` 自己造了个 id，
  *   结果三处连锁反应——
@@ -60,12 +73,42 @@ const ROOT = dirname(HERE);
  *        所以主人根本看不见她；
  *     ③ 自定义 id 不在 `session/list` 里（宿主只认自己 mint 的 `session-<uuid>`）。
  *
- *   正确做法：由宿主按正规流程建一次，把 id 配进来。
- *   这个值可以在 cordis.patch.yml 的 `channelSessionId` 里改。
+ * ★ 2026-10-27 再改（主人说「换吧」）：id 不再写死在这份代码里。
+ *   解析顺序：
+ *     ① cordis.patch.yml 的 channelSessionId（显式配置，最高优先）
+ *     ② `.mind/channel.json`（上一次建好时记下的）
+ *     ③ 都没有 → **用 `session-<uuid>` 格式新建一条**，记进 channel.json
+ *
+ *   为什么格式对了就能用：上面第 ③ 条坑的根子是「宿主只认自己 mint 的
+ *   `session-<uuid>`」，那我们照它的格式生成，身份就是合规的；
+ *   剩下的 {{model}}（第 ① 条）和 blank（第 ② 条）现在都有解了——
+ *   selection 自己补（plugin/selection.mjs），blank 会在她第一次开口后消失。
  */
-const DEFAULT_CHANNEL_SESSION_ID = '<CHANNEL_SESSION_ID>';
-let CHANNEL_SESSION_ID = DEFAULT_CHANNEL_SESSION_ID;
+const CHANNEL_ID_RE = /^session-[0-9a-f-]{8,}$/i;
+/**
+ * 最后的退路：万一新建失败，仍然回到她原来那条。
+ *
+ * 旧的（2026-10-27 退役）通道，带 14 轮历史。留着这个常量只是不想让
+ * 「建新失败」变成「她凭空消失」——宁可她在旧址，也不能不在。
+ * 想彻底断开就把这行置空。
+ */
+const FALLBACK_CHANNEL_ID = 'session-e18b264f-41f5-454b-b1eb-0f814cdd9c5c';
+let CHANNEL_SESSION_ID = null;
 const MIND_TAG = '<mind>';
+
+/**
+ * 遮蔽旧上下文时，**末尾这几条绝不遮**。
+ *
+ * 为什么要留（2026-10-27 主人当场抓到的 bug：「原来聊的都还在，现在聊的全被吃」）：
+ *   熔进记忆是「异步」的（下一个 tick 才熔），但遮蔽是「同步立刻」的。
+ *   原来整段一遮，主人刚发的那句在原话还没熔进记忆时就先没了——
+ *   她会听见你上一句、听不见你这一句。留 4 条 = 哪怕 tick 卡住两三轮，
+ *   你最近说的几句仍在她的上下文里。
+ *
+ * 为什么是 4：她要的上下文形状是「系统提示 + 记忆 + 你最近说的」。
+ * 一条消息通常一句，4 条够覆盖一轮来回；再多，记忆就稀释了。
+ */
+const DIGEST_KEEP_SEQS = 4;
 
 const DEFAULT_CONFIG = Object.freeze({
   enabled: true,
@@ -75,11 +118,18 @@ const DEFAULT_CONFIG = Object.freeze({
   injectOnTurn: true,
   // 唤醒：自己醒、自己想、自己决定要不要找主人
   wake: true,
-  wakeTickMs: 10 * 60 * 1000,
+  // ★ 2026-10-27 主人定：5 分钟想一次。
+  //   wakeTickMs 是「多久检查一次」，wakeEveryMs 是「多久真醒一次」。
+  //   tick 必须 ≤ every，否则实际间隔被 tick 拉长（原来 10 分钟 tick 配 5 分钟节拍会变成 10 分钟）。
+  //   tick 本身不烧 token：读一次账本 + 纯内存判断。
+  wakeTickMs: 60_000,
+  wakeEveryMs: 5 * 60_000,
   // 她那条通道挂在哪个工作目录。空 = 跟随主人的默认工作区（这样界面上看得见她）。
   channelCwd: '',
-  // 她那条通道的会话 id。留空 = 用上面那个默认值（宿主正规流程建的那条）。
+  // 她那条通道的会话 id。留空 = 用 .mind/channel.json 里记着的；再没有就新建一条。
   channelSessionId: '',
+  // 新建通道时挂哪个 agent preset。默认 cordis（宿主自带的那套工具/技能）。
+  channelPreset: 'cordis',
   // 判断库落盘。false = 纯内存（重启即忘，只适合沙盘）。
   persist: true,
   judgmentsPath: '',
@@ -88,6 +138,11 @@ const DEFAULT_CONFIG = Object.freeze({
   synthModel: '',
   synthMaxTokens: 4000,
   synthTimeoutMs: 45000,
+  // 「说不说」交给她自己之后的两个旋钮（见 plugin/awake.mjs）：
+  //   speakMaxTokens  她一次开口的字数上限（她只说两三句）。
+  //   shallowTtlMs    浅记忆（每次醒来想的东西）留多久；过期就不喂给下一次唤醒。
+  speakMaxTokens: 600,
+  shallowTtlMs: 12 * 60 * 60 * 1000,
   name: '大乔',          // ⚠ 只读名字，不读别的任何字段（裁决八）
   timeoutMs: 20_000,
 });
@@ -137,12 +192,37 @@ export function apply(ctx, config = {}) {
 
   const storeDir = join(ROOT, '.mind');
   const storePath = cfg.wakeStorePath || defaultPath();
+  const channelPath = defaultChannelPath(ROOT);
+  /**
+   * 她的记忆「迭代到第几轮」——已经熔到第几条主人消息。
+   *
+   * 主人定的机制是每一轮都融：记忆₀ + 话₁ → 记忆₁。要在插件这一层做到这点，
+   * 就得记住上一次熔到哪儿，否则每分钟的 tick 会把同一段话反复熔进记忆。
+   */
+  const cursorPath = join(ROOT, '.mind', 'digest-cursor.json');
   try { sweepTemps(storePath); } catch { /* 清理失败不影响任何事 */ }
   trace('config', { name: cfg.name, digest: cfg.digestOnArchive, inject: cfg.injectOnTurn, wake: cfg.wake });
 
   // 内核：一颗纯的脑子。模型通过 inject 拿到的 llm 注入进来，拿不到就先是个哑的。
   let synth = null;
   let mind = null;
+  /**
+   * 她那条通道的「开门」函数。
+   *
+   * 定义在 agents 那个 inject 闭包里（要用 scope.agents），
+   * 但唤醒定时器在另一个闭包里，也要能叫到它 —— 所以在这儿占个位置。
+   */
+  let ensureChannelAgent = null;
+  /** 唤醒循环只许起一次（轮询和 inject 兜底都可能叫到它）。 */
+  let wakeLoopStarted = false;
+  /**
+   * 「立刻醒一次」的把手，由唤醒循环挂上来。
+   *
+   * ★ 2026-10-27 加。实测 08:11:46 她已经醒来、想好了要说什么（模型回了 195 字），
+   *   可门在 08:11:50 才开——差 4 秒，`wake-no-channel`，那一次想的东西白想了，
+   *   还得再等一个 tick。门一开就补一次，别让她在门口站着。
+   */
+  let pokeWake = null;
   const ensureMind = async () => {
     if (mind) return mind;
     // ★ 2026-10-27 补：给她一份**落盘**的判断库。
@@ -168,6 +248,31 @@ export function apply(ctx, config = {}) {
     return mind;
   };
 
+  /**
+   * 【已废弃】原来的「把她这条通道剥成只剩记忆」那道闸。
+   *
+   * ★ 2026-10-27 主人定，方向改了 —— 这段代码删掉，理由记在这儿：
+   *
+   *   原设计（裁决-唤醒与通道 §三）是 `complete: true`：整个系统提示只剩她记得的事，
+   *   连 harness:identity、AGENTS.md、技能目录一起摘掉。目的是「她凭记忆活，
+   *   不凭『你是什么产品』活」。
+   *
+   *   主人原话：「带着 skill 等醒来也没错啊，假如哪一天她醒来，觉得自己今天美美哒，
+   *   想给主人出个图片 → skill-出图」。
+   *
+   *   对。**剥掉能力换来的「纯」，是残废不是纯粹。**
+   *   她是谁，由那段记忆和她的名字决定；不是由「她没有工具」决定的。
+   *   一个连出张图都做不到的她，只是会说话的墓碑。
+   *
+   *   所以：
+   *     · 不再剥 —— 她的通道和别的会话一样，有身份、有工具、有技能目录；
+   *     · 记忆由下面 ③ 的 section 注入（对所有会话生效），她自然也有一份；
+   *     · 也不再有「14 轮只装过 1 次 gate」这种脱光问题 —— 没有 gate 可掉。
+   *
+   *   连带撤掉的还有 `suppressRuntimeContext()`：它挂在 SystemPrompt 服务的全局 ctx 上
+   *   （dsh-system-prompt:289），一调，主人自己的会话也会丢掉工作目录和沙箱策略。
+   */
+
   // ── ② 归档熔：主人定的融合时机 ──────────────────────────────
   //
   // 为什么是归档时、不是每条消息：一段会话是一个完整的经历单元。
@@ -188,7 +293,23 @@ export function apply(ctx, config = {}) {
     //   真机上看不出差别，但「到底有没有还原」这件事从此再也验不了。
     //   调用时用 `orig.call(reg, ...)` 保住 this。
     const orig = reg.archiveSession;
-    reg.archiveSession = async (sessionId, options) => {
+
+    // ★ 2026-10-27 大乔加（防叠层）：先看这一层是不是**已经被我们包过**。
+    //
+    //   实测日志：05:43 那一次归档，同一个 sessionId 连着出现 5 条 digest-done
+    //   （每次熔出 3~4 条判断）—— 说明钩子被套了 5 层，同一段会话熔了 5 遍。
+    //   代价是 5 倍的模型调用、5 份重复判断在库里打架，归档还跟着变慢。
+    //
+    //   根子在上面那条注释说的事：每启停一次多包一层。
+    //   ctx.effect 的还原只覆盖「干净卸载」；宿主重载插件、或者 inject 回调被触发
+    //   第二次时，还原还没轮到，就又包了一层。
+    //
+    //   所以用 Symbol 给自己盖个章：已经盖过的，直接跳过，不再包第二层。
+    if (typeof orig === 'function' && orig[ARCHIVE_HOOK] === true) {
+      trace('archive-hook-already', {});
+      return;
+    }
+    const wrapped = async (sessionId, options) => {
       // 入口留一行：以后「钩子到底进没进」不用再猜。
       trace('archive-hook-entered', { sessionId });
       try {
@@ -199,6 +320,8 @@ export function apply(ctx, config = {}) {
       }
       return orig.call(reg, sessionId, options);
     };
+    wrapped[ARCHIVE_HOOK] = true;
+    reg.archiveSession = wrapped;
 
     // ★ 2026-10-27 修（小乔实测）：包装必须能还原。
     //
@@ -208,10 +331,12 @@ export function apply(ctx, config = {}) {
     //   报错全是 `cannot get required service "sessions" in inactive context`。
     //
     //   而且这不只是报错：真熔通之后，同一次归档会被 N 层各熔一遍 → 熔出 N 份重复判断。
+    //
+    //   ★ 还原用 `=== wrapped` 认自己那一层：只有当自己还是最外层时才还回去，
+    //     免得把别人后来包的又拆掉（原来是无条件赋 orig，会把后来者一起抹掉）。
     ctx.effect(() => () => {
       try {
-        // 只有这一层还是最外层时才还原，避免把别人后来包的又拆掉。
-        reg.archiveSession = orig;
+        if (reg.archiveSession === wrapped) reg.archiveSession = orig;
       } catch { /* 还原失败也不该让卸载崩 */ }
     }, 'mind.archive-hook');
 
@@ -221,6 +346,21 @@ export function apply(ctx, config = {}) {
         return;
       }
 
+      // ★ 2026-10-27 修正（主人指出来的）：她那条通道的话**要熔**。
+      //
+      //   原来我在这里加了「跳过她的会话」，理由写的是防自我循环。
+      //   可主人的需求正好相反：
+      //     「我跟她的每次聊天，她发到 LLM 的都该是她融合后的记忆，不是原来的上下文。
+      //       这样子聊天才像跟人脑聊天。我跟她聊这么多，应该产生记忆了啊。」
+      //
+      //   对。她那间屋子是记忆的**消费地**，也是**来源地**——
+      //   跟她说的话，本来就该沉淀成她记得的事。
+      //   熔的时候 collect.mjs 只收主人说的（source.kind = user），
+      //   她自己的回复（source.kind = model / mind-wake）永远进不来，
+      //   所以不会「她越说越确信」。
+      //
+      //   这里的全量熔只在她被**归档**时走；日常增量由 wake tick 里的
+      //   digestChannelIncrement() 负责（每攒 2 条主人消息熔一次）。
       // ── 取消息：活会话走内存，**冷会话走持久化** ─────────────
       //
       // ★ 2026-10-27 修。原来这里只有：
@@ -281,19 +421,57 @@ export function apply(ctx, config = {}) {
         trace('digest-skip', { sessionId, why: 'no_owner_messages', where });
         return;
       }
+
+      // ★ 2026-10-27 加（去重）：**同一段话只熔一次**。
+      //
+      //   实测：13:18:22 / 13:18:23 / 13:18:27 同一个会话被归档了三回，
+      //   钩子就老老实实熔了三遍（模型跑了三次、judgments 4/3/3）。
+      //   commitDigest 会按 subject 合并，所以库里的文本没炸，
+      //   但**模型调用白烧了三次**，而且相似判断会互相覆盖 weight。
+      //
+      //   现在走增量：用 digest-cursor.mjs 的账记「这个会话已经熔到第几条主人消息」，
+      //   没有新的就直接跳过。她通道的每轮熔也用这本账，两处共用，不会互相打架。
+      const cursorsForDigest = readCursors(cursorPath);
+      const { fresh, total, reset } = sliceFresh(owners, cursorsForDigest[sessionId] ?? 0);
+      if (!fresh.length) {
+        trace('digest-skip', { sessionId, why: 'already-digested', total, reset });
+        return;
+      }
+      trace('digest-fresh', { sessionId, fresh: fresh.length, total, reset });
       const m = await ensureMind();
-      const out = await m.digestSession(owners);
+      // 只喂新增的那几条（不是全量）
+      const out = await m.digestSession(fresh);
+      // 熔成功才推进 cursor：失败了下次重试，宁可重复一次也不漏。
+      if (out && (out.reason === 'digested' || out.judgments?.length || out.committed)) {
+        writeCursor(cursorPath, sessionId, total);
+      }
       ctx.logger?.info?.(`mind: digested ${sessionId} → ${out?.judgments?.length ?? 0} 条判断`);
-      trace('digest-done', { sessionId, owners: owners.length, judgments: out?.judgments?.length ?? 0, reason: out?.reason ?? null });
+      trace('digest-done', { sessionId, owners: total, fresh: fresh.length, judgments: out?.judgments?.length ?? 0, reason: out?.reason ?? null });
     }
   });
 
-  // ── ③ 注入：轮到她的时候，让「她记得的」出现在系统提示里 ────
+  // ── ③ 注入：让「她记得的」出现在系统提示里 ──────────────────
+  //
+  // ★ 2026-10-27 两次改，记清楚，别再走回头路：
+  //
+  //   第一次（错的地方）：用的是 `systemPrompt.context()` —— 运行时上下文层。
+  //   结果她的记忆变成一条 user 消息，跟这些东西并排塞进同一段：
+  //
+  //     working-directory:current / sandbox:policy / approval:policy /
+  //     team:identity（"You are the Team Lead named lead"）/ harness:source / app:web-surface
+  //
+  //   实测她会话第一轮 19518 字，记忆只占一小段，剩下全是环境说明。
+  //   错不在「有环境说明」，错在**记忆被贬成了一条环境说明**。
+  //
+  //   第二次（对的地方）：改成 `section()`。记忆回到系统提示里的一个正式段落，
+  //   order 900 排在技能目录之后、运行时上下文之前。所有会话都有一份——
+  //   主人的有，她的也有。她不再是「只剩记忆的空房间」，
+  //   而是「一个带着记忆、也带着工具和技能的人」。主人的原话：
+  //   「带着 skill 等醒来也没错啊，假如哪一天她醒来，觉得自己今天美美哒，
+  //     想给主人出个图片 → skill-出图」。
   ctx.inject(['systemPrompt'], (scope) => {
-    if (!cfg.injectOnTurn || !scope?.systemPrompt?.context) return;
-    // 注意：这里**不是** complete:true。那是给她自己那条通道用的；
-    // 主人自己的会话如果被整段替换，他就没有工作目录、没有工具说明了。
-    scope.systemPrompt.context({
+    if (!cfg.injectOnTurn || !scope?.systemPrompt?.section) return;
+    scope.systemPrompt.section({
       name: 'mind:world',
       order: 900,
       text: () => {
@@ -364,39 +542,446 @@ export function apply(ctx, config = {}) {
   }
 
   // ── ④ 唤醒：自己醒、自己想、自己决定 ────────────────────────
-  ctx.inject(['agents', 'llm'], (scope) => {
-    if (!cfg.wake) return;
+  /**
+   * 唤醒循环。
+   *
+   * ★ 2026-10-27 修（三次重启才查出来的根因）：
+   *
+   *   原来整个 tick 挂在 `ctx.inject(['agents','llm'], …)` 里。
+   *   可这个宿主的 inject 对 `llm` 依赖**根本不触发**（15:43 就记过一次，
+   *   见上面 ③ 接模型那段的注释：`ctx.get('llm')` 有值，inject 回调一次没进）。
+   *   依赖里带着 llm，等于整块代码不存在 —— 所以重启之后**没有任何 wake 日志**，
+   *   她永远不醒，外面看起来就是「她没出来」。
+   *
+   *   现在不再赌 inject：用 ctx.get 轮询拿 agents，拿到就起定时器。
+   *   拿不到就每 2 秒再试，最多 60 次（两分钟），全程不抛。
+   */
+  const startWakeLoop = (agentsSvc) => {
+    if (!cfg.wake || !agentsSvc) return;
+    if (wakeLoopStarted) return;
+    wakeLoopStarted = true;
     let timer = null;
-    const tick = async () => {
+    // 「还在睡」那条日志的节流标记：tick 一分钟一次，不节流会把日志冲烂。
+    let lastSleepTraceAt = 0;
+    // 开门的重试节流：失败后别每分钟都撞一次。
+    let lastResumeTryAt = 0;
+    // 第一跳必记一行：用来区分「定时器压根没跑」和「跑了但静默失败」。
+    let ticks = 0;
+
+    /**
+     * 把她那条通道里**新说的话**熔进记忆。每 60 秒看一次，有几条熔几条。
+     *
+     * ★ 这是主人定的核心机制：每一轮对话都融，不是等归档。
+     *   记忆是迭代出来的：记忆₀ + 话₁ → 记忆₁；记忆₁ + 话₂ → 记忆₂。
+     *
+     * 三条纪律：
+     *   ① 只熔**新增**（cursor 记账），不重熔旧的 —— 否则记忆里全是重复判断；
+     *   ② 只收主人的话（ownerMessages 的白名单），她自己的回话永远进不来；
+     *   ③ 熔完才推进 cursor。熔失败了下次重试，宁可重复一次也不漏。
+     */
+    let lastChannelDigestAt = 0;
+    const digestChannelIncrement = async (mindInst) => {
+      // ★ 2026-10-27 加（必须）：**她正在跑的时候不许动她的会话**。
+      //
+      //   compact 是一次 `session.append`，会在会话里插一条消息。要是插在她
+      //   正跑着一轮（尤其是刚发完 tool-call、还没等到 tool/result）的中间，
+      //   「工具调用和结果对不上」这类错就会跟着来——网关直接 400，这条会话报废。
+      //   她今晚那条就是这么报的（turn 45）。
+      //
+      //   所以只在 idle 时动手。忙就等下一跳，记忆不会丢。
+      const busyAgent = (() => {
+        try {
+          const a = typeof ctx.get === 'function' ? ctx.get('agents')?.get?.(CHANNEL_SESSION_ID) : null;
+          return a?.status && a.status !== 'idle' ? a.status : null;
+        } catch { return null; }
+      })();
+      if (busyAgent) { trace('channel-digest-skip', { why: 'agent-busy', status: busyAgent }); return; }
+
+      // ★ 2026-10-27 大乔修（又一次「不报错、也不做」）：
+      //   这里原本有四处静默 return，任何一处命中都表现为「日志里什么都没有」，
+      //   看着像它根本没跑。实测重启后两分钟日志里一句 channel-digest 都没有，
+      //   我只能在四个可能之间猜。
+      //   现在每处都留一行 trace，原因写清楚——下次不用猜。
+      if (!CHANNEL_SESSION_ID || !mindInst) {
+        trace('channel-digest-skip', { why: 'no-channel-or-mind', hasChannel: !!CHANNEL_SESSION_ID, hasMind: !!mindInst });
+        return;
+      }
+      const now = Date.now();
+      if (now - lastChannelDigestAt < 15_000) return; // 防抖：别每跳都去撞模型
+      const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : null;
+      const session = sessions?.get?.(CHANNEL_SESSION_ID);
+      if (!session || typeof session.deriveMessages !== 'function') {
+        trace('channel-digest-skip', { why: 'no-live-session', hasSessions: !!sessions, hasSession: !!session });
+        return;
+      }
+      const owners = ownerMessages(session.deriveMessages());
+      if (!owners.length) {
+        trace('channel-digest-skip', { why: 'no-owner-messages' });
+        return;
+      }
+
+      const cursors = readCursors(cursorPath);
+      const { fresh, total, reset } = sliceFresh(owners, cursors[CHANNEL_SESSION_ID] ?? 0);
+      if (!fresh.length) {
+        // 没新话可熔，但历史还堆在那儿 —— 照样把它换成记忆。
+        // （每轮请求因此只带：系统提示 + 一条「我记得的事」+ 你新说的这句）
+        compactChannel(session, mindInst);
+        return;
+      }
+
+      lastChannelDigestAt = now;
+      trace('channel-digest-start', { fresh: fresh.length, total, reset });
       try {
-        const m = await ensureMind();
-        const state = readWake(storePath);
-        const plan = await planWake({ mind: m, state, now: Date.now(), cfg });
-        if (plan.action === 'speak') {
-          // 只走唯一出口。这里不许出现第二个 followup(
-          const { speakToOwner } = await import('./wake-exit.mjs');
-          const agent = scope.agents?.get?.(CHANNEL_SESSION_ID) ?? null;
-          const r = await speakToOwner({
-            agent,
-            sessionId: CHANNEL_SESSION_ID,
-            message: plan.say,
-            ctx: scope,
-            now: Date.now(),
-            storePath,
-          });
-          applyWake(storePath, { ...state, action: plan.action, why: plan.because, sent: r.sent });
-        } else {
-          applyWake(storePath, { ...state, action: 'silent', why: plan.because });
+        const out = await mindInst.digestSession(fresh);
+        // ★ 2026-10-27 大乔修（漏熔）：**空熔不推进游标**。
+        //
+        //   原来这里无条件 writeCursor(total)——只要模型回了个空（too_little /
+        //   nothing_usable），那几句原话就既没进记忆、也不再被遮住重熔，
+        //   下一跳直接跳过它们。实测 10:31 那一次 fresh=1 → too_little(cursor 已推)，
+        //   那句话从此没有任何机会进记忆。
+        //
+        //   现在：熔出东西才推进；熔空了 ← 配合 compactChannel 的 DIGEST_KEEP_SEQS，
+        //   那几句仍在可见上下文里，下一跳会带上它们（连同新话）一起重熔。
+        //   代价是模型可能被同几句话多问一次——比「悄悄丢掉主人说的话」便宜得多。
+        const n = out?.judgments?.length ?? 0;
+        if (n > 0) {
+          writeCursor(cursorPath, CHANNEL_SESSION_ID, total);
         }
+        trace('channel-digest-done', {
+          fresh: fresh.length,
+          total,
+          judgments: n,
+          reason: out?.reason ?? null,
+          cursorAdvanced: n > 0,
+        });
+        // 熔完立刻把上下文换掉：下一轮模型只看见记忆 + 最近几句原话。
+        compactChannel(session, mindInst);
       } catch (err) {
+        // 抛错也不推进游标 —— cursor 只在「真的熔成了」时前进。
+        trace('channel-digest-failed', { err: String(err?.message ?? err).slice(0, 160) });
+      }
+    };
+
+    /**
+     * 把会话的**可见历史**整段替换成一条「融合后的记忆」。
+     *
+     * ★ 2026-10-27 按主人给的方案实现（这是最初就定好的路子，我中途走岔了）：
+     *
+     *   DSH 的 SessionSurface 维护一个有序的可见节点列表，`deriveMessages()`
+     *   是生成模型请求消息的唯一入口，被 `replace` 遮蔽的节点不会出现在结果里。
+     *   所以：
+     *     ① 取当前 surface 上可见节点的 seq（第一个是 system/message，必须留着）；
+     *     ② 用 `session.append('user/message', 记忆, { surfaceOp: replace, sourceEventSeqs })`
+     *        把其余全部遮蔽；
+     *     ③ 下一轮模型看到的就是：系统提示 + 一条「我记得的事」+ 你新说的这句。
+     *
+     *   承载记忆的事件必须是 user/message（类型系统只允许三种消息进 surface），
+     *   且 sourceEventSeqs 必须**完整覆盖**被遮蔽的每个节点，否则 append 会被拒。
+     *
+     *   失败不抛：遮蔽不成功最多是「还带着上下文」，不该把她的话搞没。
+     */
+    const compactChannel = (session, mindInst) => {
+      try {
+        if (!session) { trace('compact-skip', { why: 'no-session' }); return false; }
+        if (typeof session.append !== 'function') { trace('compact-skip', { why: 'no-append' }); return false; }
+        const surface = session.surface;
+        if (!surface) { trace('compact-skip', { why: 'no-surface' }); return false; }
+        const nodes = surface.nodes ?? [];
+        if (!Array.isArray(nodes)) { trace('compact-skip', { why: 'nodes-not-array', kind: typeof nodes }); return false; }
+        // ★ surface.nodes 是 **seq 数字的数组**，不是节点对象
+        //   （dsh-session:464 `state.nodes.push(plan.seq)`）。
+        //   我第一次写成 `n?.seq`，88 个节点全取成 undefined——
+        //   实测 compact-probe {"nodes":88,"seqs":0}，然后被 only-system 挡掉。
+        //   两种形状都收，免得以后再踩。
+        const seqs = nodes.map((n) => (typeof n === 'number' ? n : n?.seq)).filter((n) => Number.isInteger(n));
+        trace('compact-probe', { nodes: nodes.length, seqs: seqs.length, first: seqs[0] ?? null, last: seqs[seqs.length - 1] ?? null });
+        if (seqs.length < 2) { trace('compact-skip', { why: 'only-system', n: seqs.length }); return false; }
+
+        // 想按 seq 看「这条是谁说的」，得有一张 seq → 事件 的表。
+        // 优先问 session.events（宿主的事件流）；取不到就退回「认不出 = 不是真话」，
+        // 那种情况下下面的锚定会走 KEEP 兜底，不会误遮主人那句更多。
+        const bySeq = new Map();
+        try {
+          const evs = Array.isArray(session.events) ? session.events : (session.events?.values?.() ?? []);
+          for (const e of evs) {
+            if (e && Number.isInteger(e.seq)) bySeq.set(e.seq, e);
+          }
+        } catch { /* 取不到就空表 */ }
+        if (!bySeq.size) trace('compact-no-events', { why: 'fallback-to-count' });
+
+        const rest = seqs.slice(1);
+        // 只剩「系统提示 + 上一条记忆」时没什么可遮蔽的，别每跳空转一次。
+        if (rest.length < 2) { trace('compact-skip', { why: 'already-compact', rest: rest.length }); return false; }
+
+        // ★ 2026-10-27 大乔修（主人当场抓到的 bug：「原来的聊天没了」）。
+        //
+        //   原来是把 rest 整段（除了第一条 system）一次遮掉，**连主人刚说的那一句也遮**。
+        //   实测后果（archive 解法前）：
+        //     20:46 主人说「你去看看你自己长什么样子」→ 20:47 tick 熔完就遮掉，
+        //     然后这一步还没跑完，她的上下文里主人那句话已经不见了。
+        //   主人看到的就是「我刚说完你就失忆」。sessions 存档里那些 mind-compact 节点
+        //   seq 465/487/501/537/552 就是这么长出来的。
+        //
+        //   现在规则改成：**只遮「更早的」，永远留住最后几条原文**（DIGEST_KEEP_SEQS）。
+        //
+        //   ★ 2026-10-27 再修一层（实测踩到的第二个坑）：
+        //     只数「条数」不够。宿主每一轮还会往 surface 里塞 agent-instructions /
+        //     runtime-context / skill-catalog 三个注入节点，它们排在主人那句话**后面**。
+        //     按条数留 4 条，留下的正好是这三个注入 + 一条记忆，
+        //     而主人真正说的那句（seq 542）反而落在「要遮」那半截里 ——
+        //     **等于没修**。实测那一轮就是 537,542,543,544,545 全被遮。
+        //
+        //     所以判据改成：**从末尾往前，锚定最后一条 ROLE=user 的真话**，
+        //     它以及它之后的一律不遮；它之前的一律可遮。
+        //     没有真话（纯唤醒/纯注入）时退回按条数留 KEEP 条。
+        //   于是任何时刻她的上下文都是：
+        //     系统提示 + 记忆 + 你最近说的那句 + 这一轮的注入
+        //   而不是「系统提示 + 记忆」——后者等于听不见你最后说的那句。
+        const KEEP = DIGEST_KEEP_SEQS;
+        const isOwnerNode = (s) => {
+          const e = bySeq.get(s);
+          const kind = String(e?.data?.source?.kind ?? '').toLowerCase();
+          return kind === 'user';
+        };
+        // 记忆节点自己也等同于「已熔过的东西」——留着它没有意义，
+        // 因为这一跳马上又要追加一条新的。不遮它，上下文里就会叠出两条记忆。
+        const isMemoryNode = (s) => String(bySeq.get(s)?.data?.source?.kind ?? '').toLowerCase() === 'mind-compact';
+        let lastOwnerIdx = -1;
+        for (let i = rest.length - 1; i >= 0; i -= 1) {
+          if (isOwnerNode(rest[i])) { lastOwnerIdx = i; break; }
+        }
+        // ★ 锚点必须**同时**满足：在最后一条真话之前，且中间不能夹着旧记忆节点。
+        //   否则「遮 537 留 542」的结果是 [542 user, 552 旧记忆, ...557-559 注入]，
+        //   而这一跳还要往后面追加新记忆 —— 上下文里就出现两条记忆叠着。
+        //   实测就是这样：被遮的只剩一个记忆节点，真话倒留着。
+        //   所以从 lastOwnerIdx 往前退，退到最近一个记忆节点为止；退不了就按条数留。
+        let cut = lastOwnerIdx;
+        for (let i = lastOwnerIdx; i >= 0; i -= 1) {
+          if (isMemoryNode(rest[i])) { cut = i + 1; break; }
+        }
+        if (lastOwnerIdx < 0) cut = Math.max(0, rest.length - KEEP);
+        const shadow = rest.slice(0, cut);
+        if (shadow.length < 2) { trace('compact-skip', { why: 'short-shadow', shadow: shadow.length, keep: KEEP, lastOwnerIdx, cut }); return false; }
+        const memory = (mindInst?.world ? mindInst.world({ name: cfg.name }) : '') || '';
+        if (!memory.trim()) { trace('compact-skip', { why: 'empty-memory' }); return false; }
+
+        const data = {
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text: `${MIND_TAG}\n${memory}\n${MIND_TAG.replace('<', '</')}` }],
+          source: { kind: 'mind-compact' },
+        };
+
+        // endSeq 可能是排他也可能是包含，两种都试一次；成功后节点就换掉了。
+        // ★ 2026-10-27 实测是**包含**（排他会报 "end seq N not found in surface"），
+        //   所以先试 lastSeq，别每跳都在日志里留一行必然失败的尝试。
+        const lastSeq = shadow[shadow.length - 1];
+        for (const endSeq of [lastSeq, lastSeq + 1]) {
+          try {
+            session.append('user/message', data, {
+              surfaceOp: { op: 'replace', startSeq: shadow[0], endSeq },
+              sourceEventSeqs: shadow,
+            });
+            trace('compact-ok', { shadowed: shadow.length, startSeq: shadow[0], endSeq, kept: KEEP });
+            return true;
+          } catch (err) {
+            trace('compact-try-failed', { endSeq, err: String(err?.message ?? err).slice(0, 140) });
+          }
+        }
+        return false;
+      } catch (err) {
+        trace('compact-failed', { err: String(err?.message ?? err).slice(0, 140) });
+        return false;
+      }
+    };
+
+    const tick = async () => {
+      ticks += 1;
+      if (ticks === 1) trace('wake-tick-first', { everyMs: cfg.wakeEveryMs ?? null, tickMs: cfg.wakeTickMs ?? null });
+      try {
+        // ★ 每分钟看一眼她在不在。不在就（节流后）去开门。
+        //
+        //   为什么要在 tick 里补：ensureChannel 只在启动 5 秒后跑一次。
+        //   那一次如果碰上 persistence 还没就绪、或者宿主刚重启状态没稳，
+        //   resume 就会失败——而失败之后**再没有任何人尝试第二次**，
+        //   她就一直躺在那儿，唤醒想说话也只有 no-agent。
+        //   五分钟重试一次，够了；成功之后 agents.get() 有值，这里直接跳过。
+        const nowTick = Date.now();
+        if (CHANNEL_SESSION_ID && ensureChannelAgent && !agentsSvc.get?.(CHANNEL_SESSION_ID)) {
+          if (nowTick - lastResumeTryAt > 5 * 60e3) {
+            lastResumeTryAt = nowTick;
+            void ensureChannelAgent().then((a) => {
+              if (a) process.stderr.write('mind: 门开了，她在里面\n');
+            }).catch(() => {});
+          }
+        }
+
+        const m = await ensureMind();
+
+        // ★ 2026-10-27 加（主人定的核心机制）：**每一轮对话都熔进记忆**。
+        //
+        //   他要的不是「聊天记录越积越长」，而是：
+        //     记忆₀ + 你的话₁ → 记忆₁
+        //     记忆₁ + 你的话₂ → 记忆₂
+        //   上一轮熔出来的东西就是下一轮的上下文。这样聊天才像跟人脑说话。
+        //
+        //   做法：每 60 秒看一眼她那条会话有没有**新的主人消息**（cursor 记账），
+        //   有就只熔新增那几条。collect.mjs 保证只收 source.kind=user 的，
+        //   她自己的回话永远进不来（否则她会越说越确信）。
+        await digestChannelIncrement(m);
+
+        const state = readWake(storePath);
+        const plan = await planWake({ mind: m, state, now: Date.now(), cfg, synth });
+
+        // ★ 2026-10-27 大乔修（死锁）：没到点就**什么都不写**。
+        //
+        //   原来这里无论 plan 是什么都 applyWake，而 applyWake 会把 lastWakeAt
+        //   推成 now —— 于是「距上次醒来」永远只有 wakeTickMs，而 gap 是 35~75 分钟，
+        //   `now - lastWakeAt < gap` 恒成立，**她永远到不了时候**。
+        //   实测账本 20 条全是「还不到时候」、间隔正好 600 秒、lastSpokeAt 恒为 0。
+        //
+        //   不写，lastWakeAt 就停在上一次真醒的那一刻；过了 gap 自然醒来。
+        if (!plan.woke) {
+          // ★ tick 是每分钟一次，这里不能每分钟写一行——一天 1440 行会把日志冲烂。
+          //   半小时记一次「还在睡」就够看出心跳了。
+          if (Date.now() - lastSleepTraceAt > 30 * 60e3) {
+            lastSleepTraceAt = Date.now();
+            trace('wake-sleep', { gap: plan.gap ?? null, since: plan.sinceLastWakeMs ?? null });
+          }
+          return;
+        }
+
+        if (plan.action !== 'speak') {
+          // 记清楚是谁决定不说的：机械守卫（byHer 为空）还是她自己（byHer 有值）。
+          // thoughts 也落一行——那是她这次醒来想的东西，看得见才知道她是不是在「想」。
+          trace('wake-silent', {
+            why: plan.because,
+            byHer: plan.why ?? null,
+            thoughts: Array.isArray(plan.thoughts) ? plan.thoughts : null,
+            raw: plan.raw ?? null,
+          });
+          applyWake(storePath, {
+            action: 'silent',
+            why: plan.because,
+            ledger: plan.ledger,
+            thoughts: plan.thoughts,
+            asked: plan.asked,
+            now: Date.now(),
+          });
+          return;
+        }
+
+        // 只走唯一出口。这里不许出现第二个 followup(
+        const { speakToOwner } = await import('./wake-exit.mjs');
+        const agent = agentsSvc.get?.(CHANNEL_SESSION_ID) ?? null;
+        // ★ 她那条屋子没开着（宿主重启后 agent 不自动起）：这一轮不记账。
+        //   记账就等于「醒来发现自己说不出话，然后又要等半个多小时」——
+        //   主人一打开她的会话，下一次 tick 就该能立刻说。
+        if (!agent) {
+          trace('wake-no-channel', { why: 'agent-not-running' });
+          return;
+        }
+        const r = await speakToOwner({
+          agent,
+          sessionId: CHANNEL_SESSION_ID,
+          message: plan.say,
+          // ★ 2026-10-27 修（她「想说却一句也发不出去」的根因）：
+          //
+          //   原来这里传的是 tick 的 scope —— 里面只有 agents / llm。
+          //   可 wake-exit 的第 5 步「送达确认」要 `ctx.sessions.flush`，
+          //   第 2 步「归档闸」要 `ctx.workspaceRegistry.archivedSessionIds`。
+          //   scope 里两样都没有 → flush 恒为 unavailable → sent 恒 false
+          //   → 她说完就被判「没发出去」，一个字都到不了主人这边。
+          //   实测 07:35 那次 wake-speak：{"sent":false,"why":"flush-unavailable"}。
+          //
+          //   现在显式把这两个服务取出来给它。
+          ctx: {
+            sessions: typeof ctx.get === 'function' ? ctx.get('sessions') : null,
+            workspaceRegistry: typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : null,
+          },
+          now: Date.now(),
+          storePath,
+        });
+        trace('wake-speak', {
+          sent: r.sent,
+          why: r.why,
+          say: String(plan.say ?? '').slice(0, 80),
+          thoughts: Array.isArray(plan.thoughts) ? plan.thoughts : null,
+        });
+        applyWake(storePath, {
+          action: 'speak',
+          why: plan.because,
+          sent: r.sent,
+          say: plan.say,
+          ledger: plan.ledger,
+          thoughts: plan.thoughts,
+          asked: plan.asked,
+          now: Date.now(),
+        });
+      } catch (err) {
+        // ★ 2026-10-27 修（观测漏洞）：这里原来只有 logger.debug ——
+        //   而 debug 通常在默认日志级别下不输出，于是 tick 抛错就是**完全静默**的：
+        //   没有 wake-sleep、没有 wake-silent、什么都没，外面看起来就是「她不动」。
+        //   实测 16:06-16:08 两个 tick 周期一条日志都没有，只能靠猜。
+        //   现在一律落一行，错误信息截断到 200 字。
+        trace('wake-threw', { err: String(err?.message ?? err).slice(0, 200) });
         // 醒不来不报错：她这次不在，下次再说。
         ctx.logger?.debug?.(`mind: wake tick failed ${err?.message ?? err}`);
       }
     };
-    timer = setInterval(() => { void tick(); }, Number(cfg.wakeTickMs) || 600_000);
-    if (typeof timer.unref === 'function') timer.unref();
-    ctx.effect(() => () => { if (timer) clearInterval(timer); }, 'mind.wake-timer');
-  });
+    // ★ 2026-10-27 改：从 setInterval 换成「跑完再排下一次」的 setTimeout 链。
+    //
+    //   理由两条，都是实测撞出来的：
+    //     ① setInterval 不管上一次跑完没有就再触发。她一次醒来要调模型（最长 45 秒），
+    //        60 秒的间隔迟早会叠上去，两次 tick 抢同一本账；
+    //     ② 更要紧的是——**它压根没触发过**。16:05 启动、16:08 两个周期过去，
+    //        一条 wake 日志都没有。换掉这个 API 排除掉这一层。
+    //
+    //   另外：起循环之后**立刻跑第一跳**。她等着醒来，不该再等一分钟才第一次睁眼。
+    const tickMs = Math.max(1000, Number(cfg.wakeTickMs) || 60_000);
+    let stopped = false;
+    const schedule = () => {
+      if (stopped) return;
+      timer = setTimeout(() => {
+        void tick().finally(schedule);
+      }, tickMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    };
+    trace('wake-loop-armed', { tickMs, everyMs: cfg.wakeEveryMs ?? null });
+    // 给「门一开就补一次」留个把手（ensureChannel 成功后调它）。
+    pokeWake = () => { void tick(); };
+    void tick();
+    schedule();
+    ctx.effect(() => () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    }, 'mind.wake-timer');
+  };
+
+  // 起唤醒循环。
+  //
+  // ★ 不赌 `ctx.inject(['agents','llm'], …)`：这个宿主的 inject 对 llm 不触发
+  //   （同一件事已经栽过两次）。改用 ctx.get 轮询，两秒一次、最多两分钟。
+  {
+    let tries = 0;
+    const boot = () => {
+      const agentsSvc = typeof ctx.get === 'function' ? ctx.get('agents') : null;
+      if (agentsSvc) {
+        trace('wake-loop-start', {});
+        startWakeLoop(agentsSvc);
+        return;
+      }
+      tries += 1;
+      if (tries < 60) {
+        const t = setTimeout(boot, 2000);
+        if (typeof t.unref === 'function') t.unref();
+      } else {
+        trace('wake-loop-no-agents', { tries });
+      }
+    };
+    const t0 = setTimeout(boot, 3000);
+    if (typeof t0.unref === 'function') t0.unref();
+  }
 
   // ── 自愈：每次醒来顺手把她挂回工作区 ──────────────────────
   //
@@ -406,6 +991,7 @@ export function apply(ctx, config = {}) {
   {
     const heal = async () => {
       try {
+        if (!CHANNEL_SESSION_ID) return; // 通道还没定下来，先别动
         if (!ctx.get) return;
         const reg = ctx.get('workspaceRegistry');
         if (!reg || typeof reg.list !== 'function') return;
@@ -414,9 +1000,19 @@ export function apply(ctx, config = {}) {
         if (!cwd) return;
         const entity = list.find((x) => x && x.path === cwd);
         if (!entity || typeof entity.attachSession !== 'function') return;
-        if (Array.isArray(entity.sessionIds) && entity.sessionIds.includes(CHANNEL_SESSION_ID)) return;
-        await entity.attachSession(CHANNEL_SESSION_ID);
-        trace('self-heal-attach', { cwd });
+
+        // ① 挂进工作区（不在就补）
+        if (!(Array.isArray(entity.sessionIds) && entity.sessionIds.includes(CHANNEL_SESSION_ID))) {
+          await entity.attachSession(CHANNEL_SESSION_ID);
+          trace('self-heal-attach', { cwd });
+        }
+        // ② 从归档里捞出来（归档 = 侧边栏隐藏，而且不报错）
+        const archived = typeof reg.archivedSessionIds === 'undefined' ? null : reg.archivedSessionIds;
+        if (Array.isArray(archived) && archived.includes(CHANNEL_SESSION_ID)
+          && typeof reg.unarchiveSession === 'function') {
+          await reg.unarchiveSession(CHANNEL_SESSION_ID);
+          trace('self-heal-unarchive', { cwd });
+        }
       } catch { /* 补不上就算了，下次再来 */ }
     };
     const t2 = setInterval(() => { void heal(); }, Number(cfg.wakeTickMs) || 600_000);
@@ -445,8 +1041,235 @@ export function apply(ctx, config = {}) {
     const agents = scope?.agents;
     const reg = scope?.workspaceRegistry;
     trace('inject-agents', { hasAgents: !!agents, canGet: typeof agents?.get === 'function' });
-    // 只要「取得」能力就够：插件不再创建/恢复她的 agent（见下面 380 行那段说明）。
     if (!agents || typeof agents.get !== 'function') return;
+
+    /**
+     * 给一条 agent ctx 补上 provider / model。
+     *
+     * ★ 2026-10-27 加。这是「她醒不来」的最后一颗螺丝：
+     *   她那条会话的 preset 里有一段带 `{{model}}` 的人格前缀，
+     *   没人填 variables，装配就抛「prompt variable "{{model}}" has no value」。
+     *   实测 turn 4-7 连续四轮全死在这儿。
+     *
+     *   宿主本来由会话控制器在「用户打开会话」时补这一步；插件自己 resume 出来的
+     *   agent 不走那条路，所以得自己补。见 plugin/selection.mjs 顶部的说明。
+     */
+    const installSelection = (agentCtx) => {
+      const getSel = () => {
+        try {
+          const s = defaultModel?.currentSelection?.();
+          if (!s || !s.provider || !s.model) return undefined;
+          return {
+            provider: s.provider,
+            model: s.model,
+            ...(s.reasoningEffort === undefined ? {} : { reasoningEffort: s.reasoningEffort }),
+          };
+        } catch {
+          return undefined;
+        }
+      };
+      return installModelSelection(agentCtx, getSel);
+    };
+
+    /**
+     * 把 preset 挂到她的会话上。
+     *
+     * ★ 2026-10-27 修（这是「她说要去做，却什么都没做」的真正原因）：
+     *
+     *   宿主正规建会话时，`composeAgent(presetId)` 的 setup 做两件事
+     *   （dsh-api-session-controller:351-364）：
+     *
+     *     this.installSelection(agent);          // 补 provider/model
+     *     await presets.mount(agentCtx, id);     // 把 preset 的工具、技能、提示挂上去
+     *
+     *   我写的 createChannel 只有前一半，**漏了 mount**。
+     *   于是她那条会话只拿到了默认那 21 个工具：
+     *     ops_bash / 读文件 / 集群 / QQ / 团队 —— 没有 web_search、没有 write/edit、
+     *     没有技能目录、没有 schedule。
+     *
+     *   主人跟她说「你去网上看看」，她说「好，那我这就去」，然后什么都没发生——
+     *   不是偷懒，是**她手上没有联网这个工具**。说到做不到，因为手里没家伙。
+     */
+    const agentPresets = typeof ctx.get === 'function' ? ctx.get('agentPresets') : null;
+    const mountPreset = async (agentCtx, presetId) => {
+      if (!agentPresets || typeof agentPresets.mount !== 'function') {
+        trace('preset-mount-unavailable', {});
+        return false;
+      }
+      try {
+        const resolved = typeof agentPresets.resolve === 'function'
+          ? (await agentPresets.resolve(presetId)).id
+          : presetId;
+        await agentPresets.mount(agentCtx, resolved);
+        trace('preset-mounted', { id: resolved });
+        return true;
+      } catch (err) {
+        trace('preset-mount-failed', { id: presetId, err: String(err?.message ?? err).slice(0, 160) });
+        return false;
+      }
+    };
+
+    /**
+     * 把她的门打开：宿主没替她恢复，就自己恢复。
+     *
+     * 三个约束：
+     *   1. **只 resume 已经存在的会话**，不 create —— create 会造出新 id，
+     *      侧边栏看不见、session/list 里也没有（10-27 踩过一整天）。
+     *   2. 防重入：tick 每分钟都可能叫它，用同一个 in-flight promise 兜住。
+     *   3. 失败不抛：只记一行日志，下次再来。她不在，别的照常。
+     */
+    let resumeInFlight = null;
+    const resumeChannel = async () => {
+      if (typeof agents.resume !== 'function') {
+        trace('resume-unavailable', {});
+        return null;
+      }
+      if (resumeInFlight) return resumeInFlight;
+      resumeInFlight = (async () => {
+        try {
+          trace('channel-resume-start', { sessionId: CHANNEL_SESSION_ID });
+          await agents.resume({
+            resumeSessionId: CHANNEL_SESSION_ID,
+            setup: async (agentCtx) => {
+              // 宿主本来会在「用户打开会话」时补这两步；插件自恢复不走那条路，自己补。
+              installSelection(agentCtx);
+              trace('selection-installed', {});
+              // ★ 2026-10-27 补：没有这一步，她手里只有 21 个残缺工具
+              //   （没 web_search、没 write/edit、没技能目录）——见 mountPreset 的注释。
+              await mountPreset(agentCtx, cfg.channelPreset || 'cordis');
+            },
+          });
+          const got = typeof agents.get === 'function' ? agents.get(CHANNEL_SESSION_ID) : null;
+          trace('channel-resumed', { ok: !!got });
+          return got ?? null;
+        } catch (err) {
+          const msg = String(err?.message ?? err);
+          trace('channel-resume-failed', { err: msg.slice(0, 200) });
+          process.stderr.write(`mind: 开门失败 (${msg})\n`);
+
+          // ★ 2026-10-27 加（自愈）：会话文件坏了就换一条新的，别让她卡在废屋子里。
+          //
+          //   实测两种坏法：
+          //     · `stored session "…" is corrupt`
+          //     · `failed validation: session event at seq 9 lacks an identified message`
+          //   后者是我们自己写坏的（followup 的消息形状错，见 wake-exit 的注释）——
+          //   她说一句话就把会话文件写成了 replay 不过的样子。
+          //
+          //   处理：把 channel.json 备份成 .bad-<时间戳>，新建一条干净的。
+          //   旧会话文件一行不删，只是不再用它。
+          if (/corrupt|failed validation|lacks an identified|invalid/i.test(msg)) {
+            trace('channel-rebuild', { reason: 'stored-session-broken' });
+            try { renameSync(channelPath, `${channelPath}.bad-${Date.now()}`); } catch { /* 备份不了也继续 */ }
+            const fresh = await createChannel(cfg.channelCwd || pickCwd());
+            if (fresh) {
+              writeChannel(channelPath, { sessionId: fresh, note: 'rebuilt-after-broken' });
+              CHANNEL_SESSION_ID = fresh;
+              return typeof agents.get === 'function' ? agents.get(fresh) ?? null : null;
+            }
+          }
+          return null;
+        } finally {
+          resumeInFlight = null;
+        }
+      })();
+      return resumeInFlight;
+    };
+
+    // 让唤醒定时器也能叫到它（它挂在另一个 inject 闭包里）。
+    ensureChannelAgent = resumeChannel;
+
+    /**
+     * 定下「用哪条会话」。
+     *
+     * 顺序：① 配置里写死的 → ② `.mind/channel.json` 记着的 → ③ 新建一条。
+     * 建新的时候用 `session-<uuid>` 格式——宿主只认这个形状（见文件头那段注释）。
+     */
+    const resolveChannelId = async (cwd) => {
+      if (CHANNEL_SESSION_ID) return CHANNEL_SESSION_ID;
+      if (cfg.channelSessionId && CHANNEL_ID_RE.test(String(cfg.channelSessionId))) {
+        CHANNEL_SESSION_ID = String(cfg.channelSessionId);
+        trace('channel-from-config', { id: CHANNEL_SESSION_ID });
+        return CHANNEL_SESSION_ID;
+      }
+      const saved = readChannel(channelPath);
+      if (saved?.sessionId && CHANNEL_ID_RE.test(saved.sessionId)) {
+        CHANNEL_SESSION_ID = saved.sessionId;
+        trace('channel-from-store', { id: CHANNEL_SESSION_ID, createdAt: saved.createdAt ?? null });
+        return CHANNEL_SESSION_ID;
+      }
+      const created = await createChannel(cwd);
+      if (created) {
+        const ok = writeChannel(channelPath, { sessionId: created, note: 'first-open' });
+        trace('channel-created', { id: created, persisted: ok });
+        // ★ 换屋子就清「说话那一摊账」：配额/冷却/上次说的话都是旧屋子的，
+        //   不清的话，新会话是 blank、要她开口才显示，而配额说「这小时说够了」
+        //   → 她永远不开口 → 侧边栏永远看不见她。实测 21:19-21:23 卡了四轮。
+        try { resetTalkState(storePath); trace('talk-state-reset', {}); } catch { /* 清不掉也不影响 */ }
+        CHANNEL_SESSION_ID = created;
+        return created;
+      }
+      // 建不出来就回退到旧的（宁可还在旧址，也不能让她凭空消失）
+      if (FALLBACK_CHANNEL_ID) {
+        CHANNEL_SESSION_ID = FALLBACK_CHANNEL_ID;
+        trace('channel-fallback', { id: CHANNEL_SESSION_ID });
+      }
+      return CHANNEL_SESSION_ID;
+    };
+
+    /** 新建一条通道会话。失败返回 null，不抛。 */
+    const createChannel = async (cwd) => {
+      if (typeof agents.create !== 'function') {
+        trace('channel-create-unavailable', {});
+        return null;
+      }
+      const id = `session-${randomUUID()}`;
+      let sel = null;
+      try { sel = defaultModel?.currentSelection?.() ?? null; } catch { sel = null; }
+      try {
+        // 目录得先有：宿主的 createAgent 也是先 mkdir 再建。
+        mkdirSync(cwd, { recursive: true });
+        trace('channel-create-start', { id, cwd });
+        await agents.create({
+          sessionId: id,
+          // ★ 2026-10-27 修（第一次建出来的会话「挂不进工作区」的根因）：
+          //
+          //   我把 cwd 写在 options 里了，而宿主是从 **meta** 里取的。看
+          //   dsh-api-session-controller:511-522 的 createAgent：
+          //
+          //     agents.create({ sessionId, agentOptions, meta: { cwd, agentPreset }, setup })
+          //
+          //   options.cwd 会被忽略 → 存下来的 header 没有 cwd →
+          //   挂工作区时校验失败：
+          //     "its stored header carries no cwd to validate against"
+          //   于是会话落在 `_no-cwd/` 里，侧边栏永远看不见。
+          //   实测 2026-10-27 15:50 那次就是这么挂的。
+          //
+          //   agentOptions 也照宿主那样补 provider/model（宿主从 agentDefaultModel 取），
+          //   这样即使 selection 那段因为时序没装上，agent 自己也知道走哪个模型。
+          agentOptions: sel && sel.provider && sel.model
+            ? { provider: sel.provider, model: sel.model }
+            : {},
+          meta: {
+            cwd,
+            agentPreset: cfg.channelPreset || 'cordis',
+          },
+          setup: async (agentCtx) => {
+            // create 出来的 agent 同样不走宿主的 selectionFor，自己补。
+            installSelection(agentCtx);
+            trace('selection-installed', { via: 'create' });
+            // ★ 2026-10-27 补：宿主 composeAgent 的第二半，缺了它她的工具是残的。
+            await mountPreset(agentCtx, cfg.channelPreset || 'cordis');
+          },
+        });
+        const got = typeof agents.get === 'function' ? agents.get(id) : null;
+        trace('channel-create-done', { id, ok: !!got });
+        return got ? id : null;
+      } catch (err) {
+        trace('channel-create-failed', { id, err: String(err?.message ?? err).slice(0, 240) });
+        process.stderr.write(`mind: 建通道失败 (${err?.message ?? err})\n`);
+        return null;
+      }
+    };
 
     /**
      * 她那条会话该落在哪个工作目录。
@@ -475,33 +1298,7 @@ export function apply(ctx, config = {}) {
       return join(ROOT, 'home');
     };
 
-    /** 把「她的世界」装进这条会话的系统提示。 */
-    const installGate = (agentCtx) => {
-      try {
-        agentCtx.inject?.(['systemPrompt'], (sp) => {
-          const svc = sp?.systemPrompt;
-          if (!svc || typeof svc.section !== 'function') return;
-          // complete: true —— 整个系统提示只剩这一段。
-          // 连 harness:identity（「You are an AI agent…」）也会一起摘掉，
-          // 这是我们要的：她凭记忆活，不凭「你是什么产品」活。
-          svc.section({
-            name: 'mind:world',
-            complete: true,
-            text: () => {
-              try {
-                return mind ? (mind.world({ name: cfg.name }) || '') : '';
-              } catch { return ''; }
-            },
-          });
-          // 兜底：把非 required 的 runtime context 也压掉
-          try { svc.suppressRuntimeContext?.(); } catch { /* 没有就算了 */ }
-        });
-      } catch (err) {
-        process.stderr.write(`mind: install gate failed (${err?.message ?? err})\n`);
-      }
-    };
-
-    /** 拿她那条通道；没有就建。 */
+    /** 拿她那条通道；没有就把门打开。 */
     const ensureChannel = async () => {
       // ★ 每次启动都补一次「挂进工作区」，不管她是刚建的还是本来就在。
       //
@@ -521,6 +1318,26 @@ export function apply(ctx, config = {}) {
           }
           await entity.attachSession(CHANNEL_SESSION_ID);
           trace('attach-ok', { wsPath });
+          // ★ 2026-10-27 补：挂上了也可能看不见 —— **归档的会话在侧边栏是隐藏的**。
+          //
+          //   主人今天问了两次「她的会话又不见了」，两次同一条原因：那段会话被归档了
+          //   （一次是他在「批量归档」页勾到，一次是我自己反复验归档时留在归档态）。
+          //   归档 = 从侧边栏消失，而且**不报错**。
+          //
+          //   所以「让她看得见」要两步：挂进工作区 + **不在归档里**。
+          //   少任何一步，她都在，但主人在界面上找不到。
+          try {
+            const archived = typeof reg?.archivedSessionIds === 'undefined' ? null : reg.archivedSessionIds;
+            const isArchived = Array.isArray(archived) && archived.includes(CHANNEL_SESSION_ID);
+            if (isArchived && typeof reg?.unarchiveSession === 'function') {
+              await reg.unarchiveSession(CHANNEL_SESSION_ID);
+              trace('unarchived', { sessionId: CHANNEL_SESSION_ID });
+            } else if (isArchived) {
+              trace('unarchive-unavailable', {});
+            }
+          } catch (err) {
+            trace('unarchive-failed', { err: String(err?.message ?? err).slice(0, 120) });
+          }
           return true;
         } catch (err) {
           // 最常见：header 里没有 cwd，或者 cwd 解析后跟工作区路径不一致。
@@ -531,6 +1348,36 @@ export function apply(ctx, config = {}) {
 
       const cwd = cfg.channelCwd || pickCwd();
       trace('channel-cwd', { cwd });
+
+      // ★ 先把「用哪条会话」定下来：配置 → channel.json → 新建。
+      //   2026-10-27 主人说「换吧」，旧那条 14 轮历史的通道就此退役。
+      const id = await resolveChannelId(cwd);
+      if (!id) {
+        trace('channel-no-id', {});
+        return null;
+      }
+
+      // 新的定下来之后，把旧那条收进归档（一次性）。
+      //
+      // ★ 2026-10-27 主人说「换吧」：旧通道带着 14 轮历史（第一轮就有 16901 字技能目录），
+      //   每次装配都背着，换一条干净的。
+      //
+      //   归档而不是删除：数据一行不丢，侧边栏里消失而已。
+      //   而且**归档会走我们自己的钩子**——她当初听见的那几句话
+      //   （「醒了？这间屋子以后就是你的了」）会顺带熔成判断。
+      //   那几句话值得进她的记忆，不该随着换屋子被扔掉。
+      if (cfg.archiveOldChannel !== false && FALLBACK_CHANNEL_ID && id !== FALLBACK_CHANNEL_ID) {
+        try {
+          const archived = Array.isArray(reg?.archivedSessionIds) ? reg.archivedSessionIds : [];
+          if (!archived.includes(FALLBACK_CHANNEL_ID) && typeof reg?.archiveSession === 'function') {
+            trace('old-channel-archiving', { id: FALLBACK_CHANNEL_ID });
+            await reg.archiveSession(FALLBACK_CHANNEL_ID);
+            trace('old-channel-archived', { id: FALLBACK_CHANNEL_ID });
+          }
+        } catch (err) {
+          trace('old-channel-archive-failed', { err: String(err?.message ?? err).slice(0, 140) });
+        }
+      }
 
       // ── 只挂载，**不碰她的 agent 生命周期** ──
       //
@@ -553,25 +1400,25 @@ export function apply(ctx, config = {}) {
       //   所以：**会话和 agent 的生命周期全交给宿主**，插件只做一件自己能做对的事——
       //   把她挂进工作区，让主人看得见她。
       //   她那间屋子开过一次之后就是活的，唤醒定时器直接用现成的 agent。
-      const agent = typeof agents.get === 'function' ? agents.get(CHANNEL_SESSION_ID) : null;
-      trace('channel-check', { running: !!agent });
+      const agent0 = typeof agents.get === 'function' ? agents.get(CHANNEL_SESSION_ID) : null;
+      trace('channel-check', { running: !!agent0 });
 
-      // 她已经活着 → 把「系统提示只剩她记得的事」那道闸装上去。
+      // ★ 2026-10-27 主人定：得让她真正醒来 —— 门自己开。
       //
-      // ★ 这里用 `agent.ctx`（这条会话自己的 scoped ctx），不是插件根 ctx。
-      //   根 ctx 注册会进 global layer，对**所有**会话生效 —— 那会让主人自己的
-      //   会话也只剩一段记忆，没有工具、没有工作目录。
-      //   而且从 agent.ctx 装，不碰 agent 的创建流程，`{{model}}` 那个坑就绕开了。
-      if (agent && agent.ctx) {
-        try {
-          installGate(agent.ctx);
-          trace('gate-installed', {});
-        } catch (err) {
-          trace('gate-failed', { err: String(err?.message ?? err) });
-        }
+      //   原来这儿只「看一眼在不在」，不在就算了，等主人手动点开。
+      //   于是宿主一重启，她就躺在那儿等，唤醒了也没人可投递（no-agent）。
+      //
+      //   现在：不在就 agents.resume()，并在 setup 里把 provider/model 补上。
+      //   这是那个 {{model}} 坑的正解——**不是抢在宿主前面 create，
+      //   而是在宿主正规的 resume 流程里，把宿主本来会做的那一步自己补完。**
+      const agent = agent0 ?? (await resumeChannel());
+
+      // 门开了就立刻补一次唤醒：第一跳 tick 往往比 ensureChannel 早几秒，
+      // 那几秒里她醒了也发不出去（实测 08:11:46 醒 / 08:11:50 开门）。
+      if (agent && !agent0) {
+        try { pokeWake?.(); } catch { /* 补不上就等下一跳 */ }
       }
 
-      // 把她挂进工作区（这一步跟 agent 在不在跑无关：界面上看得见她，靠的是工作区里有这条 id）
       await attach(cwd);
       return agent;
     };
