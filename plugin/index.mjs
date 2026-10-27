@@ -28,6 +28,7 @@ import { readFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMind } from '../src/mind.mjs';
+import { createFileIo, defaultJudgmentPath } from '../src/persist.mjs';
 import { isValidMessage } from './collect.mjs';
 import { planWake, applyWake } from './awake.mjs';
 import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
@@ -78,6 +79,9 @@ const DEFAULT_CONFIG = Object.freeze({
   channelCwd: '',
   // 她那条通道的会话 id。留空 = 用上面那个默认值（宿主正规流程建的那条）。
   channelSessionId: '',
+  // 判断库落盘。false = 纯内存（重启即忘，只适合沙盘）。
+  persist: true,
+  judgmentsPath: '',
   name: '大乔',          // ⚠ 只读名字，不读别的任何字段（裁决八）
   timeoutMs: 20_000,
 });
@@ -135,11 +139,26 @@ export function apply(ctx, config = {}) {
   let mind = null;
   const ensureMind = async () => {
     if (mind) return mind;
+    // ★ 2026-10-27 补：给她一份**落盘**的判断库。
+    //
+    //   小乔装完后查出来的硬事实：「src/*.mjs 零文件 IO，Store 就是个 this.list = []，
+    //   归档一百段会话，宿主一重启，她又变回空白。」
+    //   她说得对——会忘、但一重启就全忘，那不叫记忆。
+    //
+    //   io 不注入就是纯内存（验收脚本一直这么跑，零副作用）；
+    //   这里注入文件适配器，她才跨得过重启。
+    const io = cfg.persist === false
+      ? null
+      : createFileIo(cfg.judgmentsPath || defaultJudgmentPath(ROOT));
     mind = await createMind({
       synth: synth ?? { synthesize: async () => null },
       name: cfg.name,
       limits: cfg.limits ?? {},
+      io,
     });
+    const restored = mind?.stats?.restored ?? 0;
+    trace('mind-ready', { restored, persist: !!io, path: io?.path ?? null });
+    if (restored > 0) process.stderr.write(`mind: 记起来了 ${restored} 条判断\n`);
     return mind;
   };
 

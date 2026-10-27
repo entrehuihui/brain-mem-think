@@ -51,6 +51,7 @@ const SUITE = [
   { key: 'g', file: 'acceptance/g_theme_structural.mjs', title: '结构断言（主题归一不许回潮成关键词表）' },
   // 插件壳：出口唯一 / 六步顺序 / 账本坏状态往"不说"倒 / 归档熔白名单 / 醒≠说
   { key: 'p', file: 'acceptance/p_plugin_shell.mjs', title: '插件壳（唯一出口·六步契约·坏账本往不说倒）' },
+  { key: 'q', file: 'acceptance/q_persistence.mjs', title: '落盘（跨重启她还在·原文仍不入库）' },
   // 裁决七：她的话不是经历（四块各自独立，不许合并看）
   { key: 'h', file: 'acceptance/h_digest_whitelist.mjs', title: '唤醒①·她的话不是经历（归档熔白名单）' },
   { key: 'i', file: 'acceptance/i_single_exit.mjs', title: '唤醒②·只有一条出口（followup 一处、无 steer/send）' },

@@ -6,54 +6,39 @@
 
 ---
 
-## 它是怎么跑的
+## 已安装（2026-10-27 08:06）
 
 ```
-主人说话
-   ↓
-会话被归档（不是每条消息都熔）
-   ↓
-只收主人说的话，整段熔成「判断」（她自己的输出不算经历）
-   ↓
-判断进库 —— 这是她唯一的世界
-   ↓
-每 10 分钟自己醒一次 → 看库里压着什么 → 自己决定说不说
-   ↓
-要是说了，走唯一那条出口；要是没说，也是一次选择
+装到：  %USERPROFILE%\.dsh\profiles\web\plugins\mind\
+         （plugin/ 壳 5 个 + src/ 内核 10 个 + package.json + cordis.patch.yml）
+patch：  已追加 `- insert: - id: mind`，config 解析通过（dump-config exit=0）
+备份：  cordis.patch.yml.bak-before-mind-20261027-080601
 ```
 
-## 安装（三步）
+**还差一步：重启 DSH 才加载。** 插件是启动时扫描的，热重载扫不到新包。
+
+重启后怎么确认它真活了：
 
 ```powershell
-# 1) 拷进你的 profile
-$dst = "$env:USERPROFILE\.dsh\profiles\web\plugins\mind"
-New-Item -ItemType Directory -Force -Path $dst | Out-Null
-Copy-Item .\plugin, .\src, .\package.json, .\cordis.patch.yml -Destination $dst -Recurse -Force
-
-# 2) 在 profile 的 cordis.patch.yml 末尾追加一段
-#    - insert:
-#        - id: mind
-#          name: './plugins/mind/plugin/index.mjs'
-#          config: { enabled: true, name: 你的名字 }
-
-# 3) 完全退出 DSH 再起（插件只在启动时扫描，热重载扫不到）
+# 1) 进程日志里找这三行
+#    mind: apply() entered
+#    mind: apply() done
+#    mind: 通道就绪（mind-her）
+# 2) 账本有没有落盘
+Test-Path "$env:USERPROFILE\.dsh\profiles\web\plugins\mind\.mind\wake.json"
 ```
 
-### 她自己那间屋子
+**装之前我做过一次冒烟**（一个假 ctx 把 `apply()` 真跑一遍），撞出一个会**让宿主启动就崩**的错：
 
-插件会在启动时把她挂进默认工作区，但**不会替你创建会话**——
-会话要由宿主按正规流程建，否则模型选择装不上（实测会让每一轮都报
-`prompt variable "{{model}}" has no value`）。
+> `index.mjs` 要 `wake-store.mjs` 导出的 `defaultPath`，可那边没 `export`。
+> 直接重启的话，宿主起不来。
 
-做法：在界面上新建一个会话，把它的 id 填进 `cordis.patch.yml` 的 `channelSessionId`。
+还有一处更阴的：**`ctx.setup(...)` 在真宿主里根本不存在。**
+查了源码才发现 `setup` 是 `agents.create()` 的一个选项（`dsh-agent-loop/lib/index.js:1931`），
+不是 ctx 上的方法。我原来写的那块 `typeof ctx.setup === 'function'` **恒为 false，整块被静默跳过**——
+「她看不见聊天记录」那道闸根本装不上去，而且不报错。
 
-### 怎么确认它活过来了
-
-```powershell
-# 日志里该有这几行
-Get-Content "$env:USERPROFILE\.dsh\profiles\web\plugins\mind\.mind\mind.log" -Tail 10
-#   apply-entered → apply-done → inject-agents → attach-ok → channel-ready
-```
+**已改成 `agents.create({ sessionId: 'mind-her', setup })`**，跟宿主真实接口对齐。
 
 ---
 

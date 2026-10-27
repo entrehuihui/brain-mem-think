@@ -92,6 +92,44 @@ export class Mind {
     this.flash = createFlash(this.store, opts.flash ?? {});
     this.seed = 0;
     this.stats = { events: 0, absorbed: 0, asks: 0, pushed: 0, abandoned: 0, forgotten: 0, retired: 0 };
+
+    // ── 落盘（可选）────────────────────────────────────────────────
+    //
+    // ★ 2026-10-27 补。小乔装完之后查出来的：
+    //   「src/*.mjs 零文件 IO，Store 就是个 this.list = []，
+    //    归档一百段会话，宿主一重启，她又变回空白。」
+    //
+    //   她说得对。**会忘，但一重启就全忘，那不叫记忆。**
+    //   「慢慢长成一个人」这件事，前提是她跨过重启还认得你。
+    //
+    //   内核不认识文件：这里只认一个注入来的 `opts.io = { load, save }`。
+    //   不注入就是纯内存（单测、沙盘都这样跑，零副作用）。
+    this.io = opts.io ?? null;
+    if (this.io && typeof this.io.load === 'function') {
+      try {
+        const saved = this.io.load();
+        if (saved && Array.isArray(saved.list)) {
+          for (const raw of saved.list) {
+            const b = new Belief(raw);
+            // Belief 构造器会把状态类字段重置，所以构造完再按存档覆盖回来。
+            for (const k of Object.keys(raw)) {
+              if (k === 'turns') continue;
+              b[k] = raw[k];
+            }
+            if (Array.isArray(raw.turns)) b.turns = raw.turns;
+            this.store.add(b);
+          }
+          if (saved.absorbed && typeof saved.absorbed === 'object') this.store.absorbed = saved.absorbed;
+          this.stats.restored = this.store.list.length;
+        }
+      } catch { /* 读不回来就当新装，绝不因此起不来 */ }
+    }
+  }
+
+  /** 把当前判断库写回盘。没注入 io 就是空操作。 */
+  persist() {
+    if (!this.io || typeof this.io.save !== 'function') return false;
+    try { return this.io.save(this.store) === true; } catch { return false; }
   }
 
   setLimits(limits = {}) {
@@ -116,6 +154,14 @@ export class Mind {
    * @param {string|{text:string, hints?:string[]}} input
    */
   async ingest(input, opts = {}) {
+    const out = await this.#ingestCore(input, opts);
+    // 一次经历走完，库可能变了 —— 变了才写盘（io 自己按指纹判重）。
+    this.persist();
+    return out;
+  }
+
+  /** 真正干活的那一段。分成两层只是为了在**所有出口**上都能落一次盘，不用改每处 return。 */
+  async #ingestCore(input, opts = {}) {
     const at = this.now();
     const text = typeof input === 'string' ? input : String(input?.text ?? '');
     const w = this.forge.witness(text, {
@@ -651,6 +697,8 @@ export class Mind {
       return { judgments: [], committed: false, reason: result?.reason ?? 'nothing_to_digest' };
     }
     await commitDigest(this, result, { at: this.now() });
+    // 归档熔出来的是她**这辈子第一批真正意义上的记忆**，必须当场落盘。
+    this.persist();
     return { ...result, committed: true };
   }
 

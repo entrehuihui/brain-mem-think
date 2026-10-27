@@ -6,6 +6,7 @@ pnpm-lock.yaml
 .mind/
 *.mind/
 wake.json
+judgments.json
 mind.log
 
 # 本地临时
