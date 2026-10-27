@@ -29,6 +29,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMind } from '../src/mind.mjs';
 import { createFileIo, defaultJudgmentPath } from '../src/persist.mjs';
+import { createSynth } from './synth.mjs';
 import { isValidMessage } from './collect.mjs';
 import { planWake, applyWake } from './awake.mjs';
 import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
@@ -82,6 +83,11 @@ const DEFAULT_CONFIG = Object.freeze({
   // 判断库落盘。false = 纯内存（重启即忘，只适合沙盘）。
   persist: true,
   judgmentsPath: '',
+  // 接模型用的参数。synthProvider/synthModel 留空 = 跟随当前会话选的模型。
+  synthProvider: '',
+  synthModel: '',
+  synthMaxTokens: 500,
+  synthTimeoutMs: 45000,
   name: '大乔',          // ⚠ 只读名字，不读别的任何字段（裁决八）
   timeoutMs: 20_000,
 });
@@ -222,6 +228,34 @@ export function apply(ctx, config = {}) {
         }
       },
     });
+  });
+
+  // ── ③ 接模型：把宿主的 llm 接成内核认识的合成器 ──────────────
+  //
+  // ★ 2026-10-27 补。这是**整条链上唯一一处真正的断点**。
+  //   小乔装完之后查出来：`synth` 从头到尾没被赋值过，
+  //   全文件只有「声明」和「使用」两处，`ctx.inject(['agents','llm'])` 拿到
+  //   `scope.llm` 却一次都没用它造合成器。
+  //   于是：熔 → nothing_to_digest → 库永远空 → 追问没东西可追
+  //        → restored 恒 0 → 注入恒空。杯子擦得再亮，没接水管。
+  //
+  //   这一接上，四件事同时活了：熔、落盘、追问、改自己。
+  ctx.inject(['llm', 'agentDefaultModel'], (scope) => {
+    const s = createSynth(scope, cfg, (m) => trace('synth-error', { err: String(m).slice(0, 120) }));
+    if (!s) {
+      trace('synth-unavailable', { hasLlm: !!scope?.llm, hasDefault: !!scope?.agentDefaultModel });
+      process.stderr.write('mind: 拿不到 llm 服务，熔的路暂时是哑的\n');
+      return;
+    }
+    synth = s;
+    trace('synth-ready', { route: s.route });
+    // 接上就立刻把她叫起来：让 mind.log 出现 mind-ready、让注入块有内容。
+    // 之前 ensureMind 只在归档熔和 wake tick 里被调，聊天一辈子也触发不了它。
+    void ensureMind().then((m) => {
+      const size = m?.snapshot?.().size ?? 0;
+      const restored = m?.stats?.restored ?? 0;
+      process.stderr.write(`mind: 脑子就绪（判断 ${size} 条，恢复 ${restored} 条）\n`);
+    }).catch(() => { /* 起不来不影响别的 */ });
   });
 
   // ── ④ 唤醒：自己醒、自己想、自己决定 ────────────────────────

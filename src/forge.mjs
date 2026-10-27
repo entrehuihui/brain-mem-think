@@ -224,11 +224,20 @@ export function mainPathHolds(text, skeletons, obj = {}) {
   // ① 谓词合法
   const rel = canonicalRelation(obj.relation) ?? canonicalRelation(String(obj.theme ?? '').split('|')[0] ?? '');
   if (!rel) return false;
-  // ② 对象在材料里出现过
+  // ② 对象说得过去 —— 在材料里出现过，或者它本来就是「指人的说法」
+  //
+  // ★ 2026-10-27 修：原来只认 `material.includes(subject)`。
+  //   可模型蒸馏出来的对象名天生就是抽象过的：材料写「主人熬夜到后半夜」，
+  //   它给的对象是「他」。于是这句恒 false，**整条主路从来没生效过**。
+  //   这跟「synth 写完了没接上」是同一种病：写完了，判据把它自己判死了。
+  //
+  //   放宽到「指人的泛指」不算放水：那是语法范畴（代词/角色词），不是主题词表。
+  //   真正的把关在 ③④。
+  const GENERIC_PERSON = new Set(['他', '她', '它', '我', '你', '主人', '人', '自己', '对方', '这摊事', '这件事']);
   const subject = String(obj.subject ?? '').replace(/[^\u3400-\u9fffA-Za-z0-9]/g, '');
   if (!subject) return false;
   const material = sk.join('');
-  if (!material.includes(subject)) return false;
+  if (!material.includes(subject) && !GENERIC_PERSON.has(subject)) return false;
   // ③ 正文踩在这件事上
   // 不是「撞上一个二字就算」——「他上个月自己跑去爬山了」里的「自己」「一个」都不是这件事的内容。
   // 只有共享的片段是**实词内容**才算踩上了。纯代词/虚词不算（这是语法范畴，不是主题词表）。
@@ -257,6 +266,27 @@ export function mainPathHolds(text, skeletons, obj = {}) {
   const POINT_IN_TIME = /[上下这那前昨明后]?(月|日|号|天)|[一二三四五六七八九十两几\d](次|回|遍|趟)/;
   if (t.startsWith(subject) && ACTION.test(t) && HABIT.test(t)
     && !POINT_IN_TIME.test(t) && t.length >= 8) return true;
+
+  // ④ ★ 2026-10-27 新增：「抽象出来的判断」也该算落在这件事上。
+  //
+  //   实测真模型写的是「他不是不累，是舍不得睡」——它跟材料
+  //   「主人熬夜到后半夜才开始说话」**一个实词都不共享**，可它完全成立。
+  //   按字面判必死；按理解判，它是从这段经历里归纳出来的。
+  //
+  //   判据换成**裁决四**那条：判断可以抽象，但不许编造材料里没有的具体东西。
+  //     · 谓词合法（① 已过）
+  //     · 对象说得过去（② 已过）
+  //     · **正文里不许冒出材料中没有的具体时点/数量** ← 编造与否就分在这
+  //     · 长度够说成一句话
+  //   「他上个月自己跑去爬山了」→ 有「月」，材料里没有 → 拦
+  //   「他不是不累，是舍不得睡」→ 没有任何具体时点 → 放
+  let invented = false;
+  for (let i = 0; i + 2 <= t.length; i += 1) {
+    const g = t.slice(i, i + 2);
+    if (!POINT_IN_TIME.test(g)) continue;
+    if (!material.includes(g) && !material.includes(g.slice(1))) { invented = true; break; }
+  }
+  if (!invented && t.length >= 6) return true;
   return false;
 }
 
@@ -603,7 +633,15 @@ export class Forge {
     // 阈值：材料少（同一句话被复述、说得比它长）时天然偏低，所以只拦「离谱地对不上」；
     // 真正盯「抄原文」的是下面那条连续八个汉字的重合检查。
     const stab = rawSources.length ? stabilityOf(text, rawSources) : null;
-    if (stab != null && stab < this.opts.minStability) {
+    // ★ 2026-10-27：主路必须在这里有一票。
+    //
+    //   接上真模型之后实测：它写「他不是不累，是舍不得睡」，
+    //   跟材料「主人熬夜到后半夜才开始说话」字面稳定性只有 0.114 —— 差一点点就没了。
+    //   可这句话完全成立，是归纳，不是编造。
+    //   **拿字面重合判「有没有落在事情上」，判不了抽象。**
+    //   所以：字面不够时，让主路（谓词 + 对象 + 不许编具体时点）再判一次。
+    const mainOk = mainPathHolds(text, sources, obj);
+    if (stab != null && stab < this.opts.minStability && !mainOk) {
       return { ok: false, why: 'not_grounded', stability: Math.round(stab * 1000) / 1000, head: text.slice(0, 6) };
     }
     const trial = String(obj.relation ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
@@ -631,7 +669,7 @@ export class Forge {
     //   路二（主路，本来该有的一路）：谓词合法 + 说的对象在材料里 + 正文确实踩在这件事上。
     // 裁决四：模型显式声明 groundedIn 时，内核复核三问；任一问不过就作废、退回字面判定。
     const declareOk = declaredGrounded(obj, sources, text);
-    if (rawSources.length && !declareOk && grounding(text, rawSources) < 0.08) {
+    if (rawSources.length && !declareOk && !mainOk && grounding(text, rawSources) < 0.08) {
       return { ok: false, why: 'not_grounded', stability: 0, head: text.slice(0, 6) };
     }
     // A-① 空话：短句，且句子里没有任何具体指认（动作/对象），材料里也找不到。
