@@ -1,0 +1,38 @@
+{
+  "name": "@local/dsh-mind",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "会思考的脑子：不存任何原文，只存模型从多次经历里熔出的判断。会忘、会想多、会追问、会改自己。",
+  "main": "./plugin/index.mjs",
+  "exports": {
+    ".": "./plugin/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "plugin/",
+    "src/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "brain-mem-think"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-system-prompt": "*",
+    "@deepseek-ai/dsh-session": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

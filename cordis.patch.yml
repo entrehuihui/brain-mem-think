@@ -1,0 +1,34 @@
+# brain-mem-think 自带的 bundle patch（随插件一起安装）。
+#
+# ★ 这个文件必须和 index.mjs / package.json 一起被拷进插件目录：
+#   package.json 里的 `dsh.bundle.patch` 指向它，缺了它宿主找不到 patch，
+#   整个 bundle 的配置就是空的，插件永远不会进 apply()。
+#
+# ★ 新条目用 `- insert:`（顶层 `- id:` 是「覆盖已有条目」，新 id 会报 entry not found）。
+#
+# ★ 不写 storePath：wake-store.mjs 的 defaultPath() 缺省时按
+#   %USERPROFILE%\.dsh\profiles\web\plugins\mind\.mind\wake.json 推导。
+#   写空串会把这个键显式设成空值、反而覆盖掉那个推导。
+#
+# ★ complete: true 的独占性（2026-10-27 实测）：
+#   本机 shipped 模板的 `minimal` preset 里就有一处 `complete: true`。
+#   两个 complete 同时生效会让 assemble() 抛错，整个会话起不来。
+#   所以给她的通道会话**不许挂 minimal preset**。详见 spec/定稿-命名与闸与schema.md §11。
+- insert:
+    - id: mind
+      name: '@local/dsh-mind'
+      config:
+        enabled: true
+        # 融合时机：归档会话的那一刻（主人定的），不是每条消息
+        digestOnArchive: true
+        # 每轮开始把「她记得的」放进系统提示
+        injectOnTurn: true
+        # 自我唤醒 → 思考 → 自己决定要不要找主人
+        wake: true
+        wakeTickMs: 600000        # 每 10 分钟醒一次（醒 ≠ 说，不烧 token）
+        # ⚠ 这里只读名字。裁决八：名字之外，输出的每个字都必须来自判断库。
+        #   换人设只改这一行；voicePrompt / prefix 之类一个字节都不读。
+        name: 大乔
+        # 她那条通道的会话 id（宿主按正规流程建的那个，必填）
+        # 留空 = 用内置默认值，换机器时一定要改
+        channelSessionId: ''

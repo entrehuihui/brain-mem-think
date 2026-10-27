@@ -1,0 +1,22 @@
+# 依赖
+node_modules/
+pnpm-lock.yaml
+
+# 运行数据 —— 她的记忆、账本、日志都不进版本库
+.mind/
+*.mind/
+wake.json
+mind.log
+
+# 本地临时
+*.bak
+*.bak-*
+*.tmp-*
+_probe*.mjs
+lead_probe*.mjs
+lead_spotcheck*.mjs
+_probe*.cjs
+
+# 系统
+.DS_Store
+Thumbs.db
