@@ -271,7 +271,12 @@ export function apply(ctx, config = {}) {
       //   `collect.mjs` 早就导出了 `ownerMessages()` —— 它返回 {text, role:'user'}，
       //   正是下游要的形状。**没人用它。** 这又是「写完了没接上」。
       const owners = ownerMessages(msgs);
-      trace('digest-owners', { sessionId, where, msgs: msgs.length, owners: owners.length });
+      // ★ chars 跟条数一起报（小乔 2026-10-27 建议）。
+      //   光看条数认不出「条数对了但字数被稀释」——她那两次 owners 报 4 / 25，
+      //   材料却是 12291 / 17250 字，几乎全是技能目录。
+      //   三个数一起看（msgs / owners / chars）才能一眼认出材料脏没脏。
+      const chars = owners.reduce((n, o) => n + (o.text?.length ?? 0), 0);
+      trace('digest-owners', { sessionId, where, msgs: msgs.length, owners: owners.length, chars });
       if (!owners.length) {
         trace('digest-skip', { sessionId, why: 'no_owner_messages', where });
         return;
