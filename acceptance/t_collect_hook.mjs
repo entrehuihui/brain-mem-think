@@ -35,6 +35,21 @@ console.log('\n【一】系统注入不许当成主人的话');
   const r = checkMessage(sys);
   ok('T1.system_injection_rejected', r.ok === false, `why=${r.why}`);
 
+  // ★ 小乔 2026-10-27 从真实会话 dump 出来的取值。拒绝表当初漏了后几个：
+  //   材料 12291 字里 12k 是技能目录，owners 报 4 条、真话只有 1 条。
+  const NEW_KINDS = ['runtime-context', 'skill-catalog', 'time-context', 'wake', 'resume', 'cluster'];
+  const missed = [];
+  for (const kind of NEW_KINDS) {
+    const m = { role: 'user', content: [{ type: 'text', text: `（${kind} 注入）` }], source: { kind } };
+    if (checkMessage(m).ok) missed.push(kind);
+  }
+  ok('T1b.all_non_owner_kinds_rejected', missed.length === 0,
+    missed.length ? `漏了: ${missed.join(', ')}` : `拒收 ${NEW_KINDS.length} 种非主人来源`);
+
+  // 负控制：没有 source.kind 的老消息仍按 role 放行（不能把正常消息也挡了）
+  const noKind = { role: 'user', content: [{ type: 'text', text: '主人真说的话' }] };
+  ok('T1c.missing_kind_still_ok', checkMessage(noKind).ok === true, '没有 source.kind 时按 role 判');
+
   const mixed = [hostUser('主人真说的话'), sys, herReply('她自己的回话'), hostUser('主人又说一句')];
   const owners = ownerMessages(mixed);
   ok('T2.only_owner_left', owners.length === 2, `留下 ${owners.length} 条（应为 2）`);

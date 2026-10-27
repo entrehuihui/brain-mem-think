@@ -19,16 +19,24 @@
 const OWNER_ROLES = new Set(['user', 'human', 'owner']);
 
 /**
- * 这些 `source.kind` 一定不是主人说的：系统注入、工具结果、调度提醒、别的 agent。
- * 小乔实测：宿主把 AGENTS.md 标成 `role:'user'` + `source.kind:'agent-instructions'`，
- * 10960 字整份灌进火炉。所以这张表必须有。
+ * ★ 2026-10-27 第二修（小乔实测，这条很重要）：
+ *
+ *   第一版用的是**拒绝表**，只列了 agent-instructions / system-prompt / tool / cluster …
+ *   她把宿主的实际取值 dump 出来，当场打脸：
+ *
+ *     探针会话里主人真话只有 1 条 / 25 字，材料却有 12291 字 ——
+ *       user(25) + agent-instructions(1642) + **runtime-context(1044)**
+ *       + **skill-catalog(10960)** + **time-context(262)**
+ *
+ *   `runtime-context` / `skill-catalog` / `time-context` 三个全漏了。
+ *   owners 报 4 条、真话只有 1 条 —— **水位线虚高 2.5 倍**；
+ *   她那边两次归档熔出 0 条判断，八成就是被这堆垃圾稀释掉的。
+ *
+ *   教训：**拒绝表天生会漏**。宿主以后加一种新 kind，我们就再漏一次。
+ *   所以改成**白名单**：source.kind 只认这几个，其余一律不算主人说的。
+ *   宁可漏记，不许灌垃圾 —— 这是 collect.mjs 开头就写着的那句话。
  */
-const SYSTEM_SOURCE_KINDS = new Set([
-  'agent-instructions', 'system-prompt', 'system_prompt', 'system', 'developer',
-  'context', 'memory', 'skill', 'skills', 'reminder', 'reminders', 'resume',
-  'wake', 'wake-exit', 'tool', 'tool-result', 'tool_result', 'tool-use', 'tool-call',
-  'cluster', 'subagent', 'task',
-]);
+const OWNER_SOURCE_KINDS = new Set(['user', 'human', 'owner']);
 
 /** 认不出的、一律不收。宁可漏记，不要灌垃圾。 */
 const NEVER = new Set(['assistant', 'agent', 'bot', 'tool', 'system', 'function', 'developer']);
@@ -77,11 +85,12 @@ function roleOf(msg) {
  * @returns {{ok:boolean, text:string, why:string}}
  */
 export function checkMessage(msg) {
-  // ③ 先查来源：系统注入 / 工具结果 / 调度提醒，都不是主人的经历。
-  //    用**拒绝表**而不是白名单：宁可漏记不确定的，也不能把整份系统提示灌进去。
+  // ③ 先查来源。**白名单**：source.kind 只认 user / human / owner。
+  //    没有 source.kind 的老消息放行（拿不到来源时按 role 判）。
+  //    拒绝表会漏——宿主加一种新 kind 我们就再漏一次，这次不赌了。
   const srcKind = String(msg?.source?.kind ?? '').toLowerCase();
-  if (srcKind && SYSTEM_SOURCE_KINDS.has(srcKind)) {
-    return { ok: false, text: '', why: `system_source:${srcKind}` };
+  if (srcKind && !OWNER_SOURCE_KINDS.has(srcKind)) {
+    return { ok: false, text: '', why: `source_not_owner:${srcKind}` };
   }
   const role = roleOf(msg);
   if (!role) return { ok: false, text: '', why: 'unknown_role' };

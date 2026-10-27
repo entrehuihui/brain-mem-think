@@ -82,8 +82,13 @@ export function createSynth(scope, cfg = {}, onError = null) {
   if (!llm || typeof llm.stream !== 'function') return null;
 
   // 500 对一条 judgments 数组偏紧，flash 容易在长输出上截断，给到 800。
-  const maxTokens = Number(cfg.synthMaxTokens ?? 800);
+  // ★ 800 不够：flash 会把 800 个 token 全花在 reasoning 上，正文一个字都出不来。
+  //   实测 reasoning-delta 443 块、text-delta 0 块。给到 4000，让它先想完再说。
+  const maxTokens = Number(cfg.synthMaxTokens ?? 4000);
   const timeoutMs = Number(cfg.synthTimeoutMs ?? 45_000);
+  // 模型原话的回调。**必须留**：今天一整天最难查的就是「模型回了什么」——
+  // 材料进没进去有 owners 可看，模型说没说就只剩这一行。
+  const onReply = typeof cfg.onReply === 'function' ? cfg.onReply : null;
 
   return {
     /** 宿主模型名，供日志对照。 */
@@ -101,6 +106,8 @@ export function createSynth(scope, cfg = {}, onError = null) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       let out = '';
+      let reasoned = 0;
+      const seen = {};
       try {
         const stream = llm.stream({
           provider: route.provider,
@@ -111,7 +118,21 @@ export function createSynth(scope, cfg = {}, onError = null) {
           signal: controller.signal,
         });
         for await (const chunk of stream) {
-          if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text;
+          if (!chunk) continue;
+          seen[chunk.type] = (seen[chunk.type] ?? 0) + 1;
+          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text;
+          // block-end 兜底：**只在正文块上捡**。
+          //
+          // ★ 2026-10-27 血泪：不判 block.type，就把推理块当正文捡了。
+          //   实测 deepseek-v4.1-flash 只吐 reasoning-delta（443 块）、
+          //   一个 text-delta 都没有；我那条兜底把 3217 字英文内心推演
+          //   当成「她的判断」交给了内核。
+          else if (chunk.type === 'block-end' && chunk.block?.type === 'text'
+            && typeof chunk.block.text === 'string' && !out) {
+            out += chunk.block.text;
+          } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+            reasoned += chunk.text.length; // 只计数，绝不采用
+          }
           if (out.length > 6000) break; // 防跑飞
         }
       } catch (err) {
@@ -123,6 +144,7 @@ export function createSynth(scope, cfg = {}, onError = null) {
       }
 
       const said = out.trim();
+      onReply?.({ len: said.length, reasoned, head: said.slice(0, 100), chunks: JSON.stringify(seen) });
       if (!said) return null;
       return said;
     },

@@ -86,7 +86,7 @@ const DEFAULT_CONFIG = Object.freeze({
   // 接模型用的参数。synthProvider/synthModel 留空 = 跟随当前会话选的模型。
   synthProvider: '',
   synthModel: '',
-  synthMaxTokens: 800,
+  synthMaxTokens: 4000,
   synthTimeoutMs: 45000,
   name: '大乔',          // ⚠ 只读名字，不读别的任何字段（裁决八）
   timeoutMs: 20_000,
@@ -189,9 +189,12 @@ export function apply(ctx, config = {}) {
     //   调用时用 `orig.call(reg, ...)` 保住 this。
     const orig = reg.archiveSession;
     reg.archiveSession = async (sessionId, options) => {
+      // 入口留一行：以后「钩子到底进没进」不用再猜。
+      trace('archive-hook-entered', { sessionId });
       try {
         await digestSession(scope.sessions, sessionId);
       } catch (err) {
+        trace('archive-hook-failed', { sessionId, err: String(err?.message ?? err).slice(0, 140) });
         process.stderr.write(`mind: digest on archive failed (${err?.message ?? err})\n`);
       }
       return orig.call(reg, sessionId, options);
@@ -213,10 +216,47 @@ export function apply(ctx, config = {}) {
     }, 'mind.archive-hook');
 
     async function digestSession(sessions, sessionId) {
-      if (!sessions || typeof sessions.get !== 'function') return;
+      if (!sessions || typeof sessions.get !== 'function') {
+        trace('digest-no-sessions', {});
+        return;
+      }
+
+      // ── 取消息：活会话走内存，**冷会话走持久化** ─────────────
+      //
+      // ★ 2026-10-27 修。原来这里只有：
+      //     const session = sessions.get(sessionId);
+      //     if (!session) return;
+      //   而归档发生时，那段会话往往**已经不在运行态**了 —— `sessions.get` 返回 undefined，
+      //   于是**悄悄 return，一个字都不留**。主人第一次真归档她自己的屋子，日志里
+      //   除了一句 inject-archive 什么都没有，看起来像钩子没装上。
+      //
+      //   这已经是今天第七次「不报错、也不做」了。所以现在：
+      //     · 活会话：deriveMessages()
+      //     · 冷会话：sessionQuery.readSession() 读存下来的事件
+      //     · **两条路都留日志**，取不到也留，绝不再静默
+      let msgs = [];
+      let where = 'live';
       const session = sessions.get(sessionId);
-      if (!session) return;
-      const msgs = typeof session.deriveMessages === 'function' ? session.deriveMessages() : [];
+      if (session && typeof session.deriveMessages === 'function') {
+        msgs = session.deriveMessages();
+      } else {
+        where = 'cold';
+        const sq = typeof ctx.get === 'function' ? ctx.get('sessionQuery') : null;
+        if (sq && typeof sq.readSession === 'function') {
+          try {
+            const snap = await sq.readSession(sessionId);
+            msgs = (snap?.events ?? [])
+              .filter((e) => e && e.type === 'user/message')
+              .map((e) => ({ role: 'user', content: e.data?.content, source: e.data?.source }));
+            trace('digest-cold-read', { sessionId, events: (snap?.events ?? []).length, msgs: msgs.length });
+          } catch (err) {
+            trace('digest-cold-failed', { sessionId, err: String(err?.message ?? err).slice(0, 140) });
+          }
+        } else {
+          trace('digest-cold-unavailable', { sessionId, hasQuery: !!sq });
+        }
+      }
+
       // ★ 裁决七：只收主人说的话。她的输出不是经历，是结果。
       //   不收的话，她说一句 → 落进历史 → 下一次归档当成「发生过的事」熔进去
       //   → 她越说越确信，因为每一次说话都在给自己造证据。
@@ -231,7 +271,11 @@ export function apply(ctx, config = {}) {
       //   `collect.mjs` 早就导出了 `ownerMessages()` —— 它返回 {text, role:'user'}，
       //   正是下游要的形状。**没人用它。** 这又是「写完了没接上」。
       const owners = ownerMessages(msgs);
-      if (!owners.length) return;
+      trace('digest-owners', { sessionId, where, msgs: msgs.length, owners: owners.length });
+      if (!owners.length) {
+        trace('digest-skip', { sessionId, why: 'no_owner_messages', where });
+        return;
+      }
       const m = await ensureMind();
       const out = await m.digestSession(owners);
       ctx.logger?.info?.(`mind: digested ${sessionId} → ${out?.judgments?.length ?? 0} 条判断`);
@@ -283,8 +327,11 @@ export function apply(ctx, config = {}) {
 
   const installSynth = (llm) => {
     if (synth) return; // 已经装过，别重复
-    const s = createSynth({ llm, agentDefaultModel: defaultModel }, cfg,
-      (m) => trace('synth-error', { err: String(m).slice(0, 120) }));
+    const s = createSynth({ llm, agentDefaultModel: defaultModel }, {
+      ...cfg,
+      // ★ 模型原话必须落日志。今天最难查的就是「模型到底回了什么」。
+      onReply: (r) => trace('synth-reply', r),
+    }, (m) => trace('synth-error', { err: String(m).slice(0, 120) }));
     if (!s) {
       trace('synth-unavailable', { hasLlm: !!llm, hasDefault: !!defaultModel });
       process.stderr.write('mind: 拿不到 llm 服务，熔的路暂时是哑的\n');
