@@ -240,10 +240,17 @@ export function apply(ctx, config = {}) {
   //        → restored 恒 0 → 注入恒空。杯子擦得再亮，没接水管。
   //
   //   这一接上，四件事同时活了：熔、落盘、追问、改自己。
-  ctx.inject(['llm', 'agentDefaultModel'], (scope) => {
-    const s = createSynth(scope, cfg, (m) => trace('synth-error', { err: String(m).slice(0, 120) }));
+  //   ★ 只 inject `llm`：这是唯一真正必需的服务。
+  //     `agentDefaultModel` 写进 inject 的话，万一服务名对不上，整块**根本不触发**，
+  //     synth 又变回哑的，而且一声不响 —— 那正是今天踩了一整天的那个坑。
+  //     所以在块里尽力去取，取不到就用配置里的兜底值。
+  ctx.inject(['llm'], (scope) => {
+    const defaultModel = scope?.agentDefaultModel
+      ?? (typeof scope?.get === 'function' ? scope.get('agentDefaultModel') : null);
+    const s = createSynth({ llm: scope?.llm, agentDefaultModel: defaultModel }, cfg,
+      (m) => trace('synth-error', { err: String(m).slice(0, 120) }));
     if (!s) {
-      trace('synth-unavailable', { hasLlm: !!scope?.llm, hasDefault: !!scope?.agentDefaultModel });
+      trace('synth-unavailable', { hasLlm: !!scope?.llm, hasDefault: !!defaultModel });
       process.stderr.write('mind: 拿不到 llm 服务，熔的路暂时是哑的\n');
       return;
     }
