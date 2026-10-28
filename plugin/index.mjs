@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.want.1';
+const BUILD = '2026-10-28.want.2';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -917,7 +917,7 @@ export function apply(ctx, config = {}) {
      * 反过来的话，她会在「上一次还没结算」的时候又出去一趟，
      * 偏好就变成只会涨不会跌的计数器。
      */
-    const tryAct = async (mindInst) => {
+    const tryAct = async (mindInst, wantOverride = null) => {
       // ★ 2026-10-28 修：这四个早退点原来**一行日志都不打**。
       //   结果就是「她明明该出门，日志里却什么都没有」——跟 `digestChannelIncrement`
       //   当年那四处静默 return 是同一个病，那次也是我一个个猜出来的。
@@ -950,6 +950,20 @@ export function apply(ctx, config = {}) {
           activity: p.activity, kind: p.kind, found,
           notesBefore: p.notesBefore, notesNow,
         });
+        // ★ 2026-10-28（主人要的）：她做过的事要变成记忆里的一件真事。
+        //   不写这一条，看小说 / 听歌 / 挑衣服就只是「出过门」，记忆里一片空白。
+        try {
+          const ep = mindInst?.recordEpisode?.({
+            what: `我去${p.activity}`,
+            feel: null,
+            arousal: 0.5,
+            who: '我',
+            source: p.kind === 'want' ? 'want' : 'act',
+          });
+          if (ep?.ok) trace('act-episode', { what: ep.what, source: p.kind === 'want' ? 'want' : 'act' });
+        } catch (err) {
+          trace('act-episode-failed', { err: String(err?.message ?? err).slice(0, 120) });
+        }
         st.pending = null;
         writeMotive(motivePath, st);
       }
@@ -964,15 +978,31 @@ export function apply(ctx, config = {}) {
         ...((mindInst.store?.list ?? []).map((b) => Number(b.updatedAt ?? b.createdAt) || 0)),
       );
       // recent：今天已经去过哪。给 urges 用来「让位」，别让同一条悬案天天霸榜。
-      const list = urges({
-        notes,
-        preferences: st.preferences,
-        recent: Array.isArray(st.budget?.recentActs) ? st.budget.recentActs : [],
-        now,
-        lastFreshAt,
-      });
-      if (!list.length) { trace('act-idle', { why: 'no_urge' }); return false; }
-      const urge = list[0];
+      // ★ 2026-10-28（主人定的）：她自己说了想做，就做她说的那件——
+      //   内核的候选只在她说不出想做什么时才兜底。判断权在她，不在列表。
+      let urge;
+      if (wantOverride?.activity) {
+        urge = {
+          kind: 'want',
+          target: `want:${wantOverride.activity}`,
+          activity: String(wantOverride.activity),
+          drive: 1,
+          why: String(wantOverride.why || '我自己想去做这件事'),
+          from: 'her_want',
+          themeKey: null,
+        };
+        trace('act-from-want', { activity: urge.activity, why: urge.why });
+      } else {
+        const list = urges({
+          notes,
+          preferences: st.preferences,
+          recent: Array.isArray(st.budget?.recentActs) ? st.budget.recentActs : [],
+          now,
+          lastFreshAt,
+        });
+        if (!list.length) { trace('act-idle', { why: 'no_urge' }); return false; }
+        urge = list[0];
+      }
 
       // ③ 过闸
       const verdict = canAct({

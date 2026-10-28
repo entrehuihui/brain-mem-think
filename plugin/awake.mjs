@@ -51,6 +51,10 @@ import { readWake, writeWake } from './wake-store.mjs';
  *   ledger?:string, hash?:string, why?:string
  * }>}
  */
+// ★ 2026-10-28：只问「想不想做事」的低频探针，跟说话配额分开记。
+//   内存变量即可：重启归零最多多问一次，不影响正确性。
+let lastWantProbeAt = 0;
+
 export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth = null, ctx = {} } = {}) {
   const st = state ?? readWake();
 
@@ -106,6 +110,43 @@ export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth 
     opts: gateOpts,
   });
   if (!g.pass) {
+    // ★ 2026-10-28（主人指出的）：**说话配额不该把「想不想做事」一起挡掉。**
+    //
+    //   实测：她一小时说满之后，日志全是
+    //     wake-silent {why:"这一小时已经说了 4 次，再说就是吵", byHer:null, thoughts:null}
+    //   `byHer:null` = 模型根本没被问 —— 于是「你想不想自己去做点什么」也一起问不到。
+    //   说不说、做不做，是两件事；配额只该压前一件。
+    //
+    //   所以：配额满时仍然低频问一次（默认 30 分钟），**只取 want**，
+    //   说还是不说照旧压着。成本一天 48 次，不是每 5 分钟一次。
+    const quotaBlocked = /已经说了|连着说|刚说完/.test(g.why);
+    const wantEvery = Math.max(60_000, Number(cfg.wantAskEveryMs ?? 30 * 60e3));
+    if (quotaBlocked && now - lastWantProbeAt >= wantEvery) {
+      lastWantProbeAt = now;
+      try {
+        const world = (typeof mind?.world === 'function' ? mind.world({ name: cfg.name }) : '') || '';
+        const sources = notes.map((n) => n?.note ?? n?.text ?? '').filter(Boolean);
+        const v = await askSpeak({
+          synth, world, name: cfg.name, state: st, now, cfg, sources,
+          // 这一刻还没算浅记忆/屋子备注（它们在函数后半段），probe 只问「想不想做事」。
+          lastThoughts: null,
+          note: '',
+        });
+        return {
+          woke: true,
+          action: 'silent',
+          because: '说够了，只问问她想做什么',
+          why: 'want_probe',
+          ledger: g.ledger,
+          thoughts: Array.isArray(v.thoughts) ? v.thoughts : [],
+          want: v.want ?? null,
+          asked: true,
+          raw: v.raw,
+        };
+      } catch (err) {
+        return { woke: true, action: 'silent', because: g.why, ledger: g.ledger, why: `want_probe_failed:${err?.message ?? err}` };
+      }
+    }
     return { woke: true, action: 'silent', because: g.why, ledger: g.ledger };
   }
 

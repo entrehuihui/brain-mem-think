@@ -37,7 +37,7 @@ import { digestSession as runDigest, commitDigest } from './digest-session.mjs';
 import { strengthOfBelief, strengthFromEvidence } from './strength.mjs';
 import { eventFromBelief, eventFromJson, makeEvent } from './event.mjs';
 import { induce, reconcile } from './induct.mjs';
-import { addEpisode, episodeLines, pruneEpisodes } from './episode.mjs';
+import { addEpisode, episodeLines, normalizeEpisode, pruneEpisodes } from './episode.mjs';
 import { buildAssocPrompt, findPatterns, parseAssoc } from './associate.mjs';
 import { stingOf } from './sting.mjs';
 
@@ -173,6 +173,27 @@ export class Mind {
       b.sting = stingOf(b, this.episodes, { now });
     }
     return this.store.list.length;
+  }
+
+  /**
+   * ★ 2026-10-28（主人要的）：她自己做过的事，也要变成记忆里的一件真事。
+   *
+   * 为什么单独开一个入口：熔那条路只收**主人的话**（白名单），
+   * 她去看小说 / 听歌 / 挑衣服这些事，材料里根本没有她的动作——
+   * 不从这里写进去，她做过的事在记忆里就是一片空白。
+   *
+   * what 用的是她自己说想做的那个词（「看会儿小说」→「我去看会儿小说」），
+   * 不是谁替她写的段落；过和经历同一把 8 字抄原文闸。
+   */
+  recordEpisode({ what, feel = null, arousal = 0.5, who = '我', source = 'act' } = {}) {
+    const ep = normalizeEpisode({ what, feel, arousal, who, source }, { at: this.now() });
+    if (!ep) return { ok: false, reason: 'unusable' };
+    this.episodes = addEpisode(this.episodes, ep, {
+      now: this.now(),
+      limits: { max: this.episodeMax, ttlMs: this.episodeTtlMs },
+    });
+    this.persist();
+    return { ok: true, what: ep.what, id: this.episodes[this.episodes.length - 1]?.id ?? null };
   }
 
   /** 把当前判断库写回盘。没注入 io 就是空操作。 */

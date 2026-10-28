@@ -264,5 +264,20 @@ console.log('\n[⑨] 情境检索（3-5 条，不是全库）');
   ok('取不到情境时退回（不硬撑）', /const currentFocus = \(\) => [\s\S]{0,700}return null/.test(plugSrc2));
 }
 
+// ── ⑩ 想不想做事：由她说，不由内核发牌 ───────────────────────────
+console.log('\n[⑩] 想不想做事（want）');
+{
+  const awake = readFileSync(join(ROOT, 'plugin', 'awake.mjs'), 'utf8');
+  const plug = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+  const mindS = readFileSync(join(ROOT, 'src', 'mind.mjs'), 'utf8');
+  const speak = readFileSync(join(ROOT, 'src', 'speak.mjs'), 'utf8');
+
+  ok('醒来那一问里有 want 字段', speak.includes('want') && speak.includes('parseWant'));
+  ok('说话配额满时仍低频问 want（不把她一起关掉）', awake.includes('want_probe') && awake.includes('wantAskEveryMs'));
+  ok('她想做的优先于内核候选', plug.includes('act-from-want'));
+  ok('做完写成经历（不是只出个门）', plug.includes('act-episode') && mindS.includes('recordEpisode('));
+  ok('内核不再发「无聊就刷视频」的牌', !readFileSync(join(ROOT, 'src', 'motive.mjs'), 'utf8').includes('boredomActivities'));
+}
+
 console.log(`\n==== ${fail === 0 ? '全绿' : '有红'}：${pass} 通过 / ${fail} 失败 ====\n`);
 process.exit(fail === 0 ? 0 : 1);
