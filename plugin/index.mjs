@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.want.2';
+const BUILD = '2026-10-28.want.3';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -1409,7 +1409,8 @@ export function apply(ctx, config = {}) {
           // ★ 2026-10-28（阶段 F）：她这回不想说话——先看她是不是想自己去做点什么。
           //   顺序是「说 / 做 / 歇着」，不是三选一随机。
           //   主人在等她 → 说；她不想说 → 做自己的事；都不 → 歇着。
-          const acted = await tryAct(m);
+          // ★ 2026-10-28：把「她自己说想做的事」交进去——她说的优先，内核候选只兜底。
+          const acted = await tryAct(m, plan.want ?? null);
           if (acted) return;
           // 记清楚是谁决定不说的：机械守卫（byHer 为空）还是她自己（byHer 有值）。
           // thoughts 也落一行——那是她这次醒来想的东西，看得见才知道她是不是在「想」。
