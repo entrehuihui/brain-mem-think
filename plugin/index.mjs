@@ -851,7 +851,7 @@ export function apply(ctx, config = {}) {
           } catch { return null; }
         })();
         if (busyAgent) {
-          // ★ 2026-10-28 18:35：忙，但**别让这一轮白白过去**。
+          // ★ 2026-10-28 18:35 / 18:55 修（line 1264 那处同样修，一条不许留）：
           //
           //   实测近 15 分钟 30 次 tick 全被这条挡下（why:agent-busy 30/30），
           //   而这 15 分钟里 `turn-end-hook` 一次都没出现——
@@ -859,8 +859,15 @@ export function apply(ctx, config = {}) {
           //   于是每一条 tick 都撞在这道闸上，熔一次都没跑。
           //
           //   记忆不会因为晚几分钟丢，但**晚几个小时就等于丢**。
-          //   所以忙就挂个欠账（记时间戳），等空了第一拍把它补上，
-          //   并落一行 `channel-digest-debt-settled` 记清欠了多久。
+          //
+          //   ★ 更要紧的一层（2026-10-28 18:55 想通的）：
+          //     藏着她当前情况的那段**系统提示**，是每一轮都重新取的。
+          //     熔进来的新经历要能被读到，得等**下一轮**。
+          //     而如果这一轮一直不结束，「下一轮」就永远不会来——
+          //     熔了也读不到，读不到就没有任何迹象能证明熔过。
+          //     这是一个环：忙 → 不熔 → 提示不变 → 永远还是那句旧情况。
+          //
+          //   所以欠账不是"晚点做"，是**等它一空立刻就做**。
           const stamp = Date.now();
           if (!digestDebtAt) digestDebtAt = stamp;
           trace('channel-digest-skip', { why: 'agent-busy', status: busyAgent, debtMs: stamp - digestDebtAt });
@@ -1150,6 +1157,23 @@ export function apply(ctx, config = {}) {
         : Number(cfg.actOwnerQuietMs ?? 10 * 60_000);
       if (agent.status && agent.status !== 'idle') {
         trace('act-skip', { why: 'agent-busy', status: String(agent.status) });
+        // ★ 2026-10-28 19:00：**她正忙的时候，被挡下的那个「想做的事」最该留下来。**
+        //   离线实测（10:08—10:39）七次 act-skip 全是 agent-busy，
+        //   每一次都带着一句「想给我妈打个电话」的东西，然后一起消失。
+        if (wantOverride?.activity) {
+          const stBlog = readMotive(motivePath);
+          stBlog.pending = {
+            at: Date.now(),
+            activity: String(wantOverride.activity),
+            kind: 'want',
+            why: String(wantOverride.why || ''),
+            skipper: 'agent-busy',
+            skippedWhy: 'agent-busy',
+            notesBefore: mindInst.snapshot?.().size ?? 0,
+          };
+          writeMotive(motivePath, stBlog);
+          trace('act-skip-recorded', { activity: String(wantOverride.activity), why: 'agent-busy' });
+        }
         return false;
       }
 
@@ -1171,9 +1195,20 @@ export function apply(ctx, config = {}) {
         });
         // ★ 2026-10-28（主人要的）：她做过的事要变成记忆里的一件真事。
         //   不写这一条，看小说 / 听歌 / 挑衣服就只是「出过门」，记忆里一片空白。
+        //
+        // ★ 2026-10-28 19:00（她说过、但被挡回去的那些，也要留下痕迹）
+        //
+        //   实测 09:53 / 09:58 / 10:03：她读着记忆说出了三件真想做的事
+        //   （给我妈打个电话说句实话……），每一次都被一道闸挡回去，
+        //   然后**什么都没留下**——没有出门、没有经历、日志里只剩一行人看不懂的 act-skip。
+        //
+        //   可她当时确实想到了一件事。人在心里打定一个主意那一刻，
+        //   本身就是一段经历。不算它，就等于「我想到过的事，只要没做成就不存在」。
+        //   这条对她的性格尤其要紧：她一直是那种拿「没做到」当「没想过」的人。
+        const label = p.skippedWhy ? `我想${p.activity}，没去成` : `我去${p.activity}`;
         try {
           const ep = mindInst?.recordEpisode?.({
-            what: `我去${p.activity}`,
+            what: label,
             feel: null,
             arousal: 0.5,
             who: '我',
@@ -1241,6 +1276,22 @@ export function apply(ctx, config = {}) {
           why: verdict.why, drive: urge.drive, kind: urge.kind,
           activity: urge.activity, used: verdict.used,
         });
+        // ★ 2026-10-28 19:00：被挡回去的「她想做的事」不许凭空蒸发。
+        //   记成 pending，下一次醒来结算时落成一条经历（what = 我想…，没去成）。
+        //   只记她说出来的那些（kind === 'want'）——内核兜底递的牌被挡，不算她的主意。
+        if (urge.kind === 'want' && urge.activity) {
+          st.pending = {
+            at: now,
+            activity: urge.activity,
+            kind: urge.kind,
+            why: urge.why,
+            skipper: verdict.why,
+            skippedWhy: verdict.why,
+            notesBefore: mindInst.snapshot?.().size ?? 0,
+          };
+          writeMotive(motivePath, st);
+          trace('act-skip-recorded', { activity: urge.activity, why: verdict.why });
+        }
         return false;
       }
 
