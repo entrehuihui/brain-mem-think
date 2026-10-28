@@ -68,6 +68,29 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 /**
+ * ★ 2026-10-28 21:15 第二刀：熔的极简提示词。
+ *
+ *   第一刀（去掉 reasoningEffort）是**把两条路抹平**；这一刀是**换一个底**。
+ *
+ *   理由：如果去掉 effort 之后熔还是 opener=0，那就只剩 system 那段"纪律"了。
+ *   而那段纪律里有几句正对着小模型的软肋——
+ *     · "宁可说得朴素，也不要空着交回去"
+ *     · "实在找不出来才用它"
+ *     · "禁止编造""禁止抄原文"
+ *   这些话叠在一起、又紧跟着一整段 JSON schema，
+ *   一个老实的小模型最省事的合规办法就是：**什么都不说**。
+ *   它没违反任何一条——空着，正好符合「没有可说的」那一档。
+ *
+ *   所以试一个**短、只说一件事**的版本：照格式交 JSON。
+ *   判断还是由它自己决定，只是不再把"可以空着"摆在它眼前。
+ */
+const SYSTEM_PROMPT_LITE = [
+  '你在整理一个人的记忆：读材料，按材料末尾给的 JSON 格式回答。',
+  '只输出 JSON 本身，不要解释、不要围栏。',
+  '按材料里说真实发生的事写，别编。',
+].join('\n');
+
+/**
  * 从宿主拿到 { provider, model }。一级一级往下退：
  *
  *   ① 配置里写死了 synthProvider + synthModel → 锁死，绝不漂
@@ -133,7 +156,7 @@ function pickModel(defaultModel, cfg, llm) {
  *   英文内心推演当成「她的判断」交给了内核。
  *   **推理块只计数，绝不采用。**
  */
-async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs: tmo, effort, onReply, onError }) {
+async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs: tmo, effort, sysTag, onReply, onError }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), tmo);
   let out = '';
@@ -232,6 +255,10 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
     //   如果是 1 个别的类型，那就是它把我们的话当成了别的活。
     blockKinds: JSON.stringify(blockKinds),
     streamOpened: seen['block-start'] ?? 0,
+    // ★ 2026-10-28 21:15：记下这一次用的是哪套提示词、传没传推理档。
+    //   改了提示词又不记，日志上就分不清哪一次属于哪个版本——今天就吃过这个亏。
+    sysTag: sysTag ?? null,
+    effort: effort ?? null,
   });
   if (!said) return null;
   return said;
@@ -328,20 +355,27 @@ export function createSynth(scope, cfg = {}, onError = null) {
       });
     },
 
-    /** 整理记忆那一问：系统提示写死在这份文件里。 */
+    /**
+     * 整理记忆那一问：系统提示写死在这份文件里。
+     *
+     * ★ 2026-10-28 21:15：把用的哪套提示词也记下来（`synth-reply` 里带 sysTag），
+     *   不然改了提示词、日志上分不清新旧的哪一次。
+     */
     async synthesize(material) {
       const text = String(material ?? '').trim();
       if (!text) return null;
       const route = pickModel(defaultModel, cfg, llm);
       if (!route) return null;
+      const lite = String(cfg.digestPrompt ?? 'lite') === 'lite';
       return await streamText({
         llm,
-        system: SYSTEM_PROMPT,
+        system: lite ? SYSTEM_PROMPT_LITE : SYSTEM_PROMPT,
         text,
         route,
         maxTokens,
         timeoutMs,
         effort: digestEffort,
+        sysTag: lite ? 'lite' : 'full',
         onReply,
         onError,
       });
