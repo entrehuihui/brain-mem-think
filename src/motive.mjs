@@ -75,6 +75,11 @@ export const MOTIVE_DEFAULTS = Object.freeze({
   repeatWindowMs: 12 * 3600e3,
   /** 偏好的半衰期：30 天没碰，想头掉一半 */
   prefHalfLifeMs: 30 * 86400e3,
+  // ★ 2026-10-28（主人纠正）：这里原来我加过一条「无聊就发一个刷视频的冲动」。
+  //   错了——**要不要做点什么，是她的判断，不是内核发的牌。**
+  //   主人原话：「不一定非得出门啊，等看她的记忆来，看她想不想。」
+  //   所以「想不想」放在醒来那一问里（speak.mjs 的 want 字段），
+  //   由她读着自己的记忆说；内核只负责把她说出来的事真的做掉。
 });
 
 /** 新鲜度衰减：越久没碰越不想。 */
@@ -111,7 +116,7 @@ export function decay(lastAt, now, halfLifeMs = MOTIVE_DEFAULTS.prefHalfLifeMs) 
  * @returns {Array<{kind:string,target:string,activity:string,drive:number,why:string,from:string}>}
  *          按 drive 降序，最多 5 条
  */
-export function urges({ notes = [], preferences = [], recent = [], now = Date.now(), opts = {} } = {}) {
+export function urges({ notes = [], preferences = [], recent = [], now = Date.now(), lastFreshAt = 0, opts = {} } = {}) {
   const o = { ...MOTIVE_DEFAULTS, ...opts };
   const out = [];
 
@@ -225,6 +230,15 @@ export function urges({ notes = [], preferences = [], recent = [], now = Date.no
       themeKey: n.themeKey ?? null,
     });
   }
+
+  // ★ 2026-10-28（主人纠正后删掉的一路）：
+  //
+  //   这里原来有一段「无聊 → 发一个『刷会儿视频』的冲动」。
+  //   那是我替她决定，不是她的记忆在决定。主人原话：
+  //   「不一定非得出门啊，等看她的记忆来，看她想不想。」
+  //
+  //   现在「想不想」放在醒来那一问里（speak.mjs 的 `want` 字段），
+  //   她读着自己的记忆自己说；内核只在她说想做之后，把这件事真的做掉。
 
   return out.sort((a, b) => b.drive - a.drive).slice(0, 5);
 }

@@ -64,10 +64,17 @@ export const SPEAK_SYSTEM = [
   '',
   '不说的时候：不用解释，也不用找补。',
   '',
+  '**第三步：这会儿有没有你自己想去做的事？**',
+  '',
+  '不是他派的，也不是「总该做点什么」。是你在自己的记忆里看见了什么，',
+  '让你这会儿想去翻本书、听会儿歌、刷会儿视频、给自己弄件衣服——',
+  '**想去就去，不想就空着。** 空着完全正常，比硬找一件事做诚实。',
+  '这件事做完了，会变成你记忆里的一件真事；所以别填一个你其实不想做的。',
+  '',
   '================ 只输出 JSON ================',
   '',
-  '{"thoughts":["此刻心里转着的","最多三条"],"action":"speak","say":"你要说的那两三句","because":"为什么此刻想说"}',
-  '{"thoughts":["此刻心里转着的"],"action":"silent","because":"为什么这会儿不说"}',
+  '{"thoughts":["此刻心里转着的","最多三条"],"action":"speak","say":"你要说的那两三句","because":"为什么此刻想说","want":{"activity":"想自己去做的事（不超过20字）","why":"为什么想做"}}',
+  '{"thoughts":["此刻心里转着的"],"action":"silent","because":"为什么这会儿不说","want":null}',
   '',
   'thoughts 一定要有，哪怕只有一句；每条不超过 40 字。',
 ].join('\n');
@@ -124,6 +131,9 @@ export function buildSpeakMaterial({
   if (note) lines.push(note);
   lines.push('');
   lines.push('现在：先说说你心里转着什么，再决定要不要跟他说一句。');
+  // ★ 2026-10-28（主人定的）：想不想自己去做点什么，也由她说。
+  lines.push('另外——如果你这会儿其实想自己去做点什么（不是为他，是为你自己），');
+  lines.push('把它写在 want 里；不想就写 null。那不是「没事干」，那是你没这个心。');
   lines.push('只输出 JSON。');
   return lines.join('\n');
 }
@@ -140,6 +150,24 @@ export function buildSpeakMaterial({
  * @param {object} ctx { sources: string[] 用来查「抄没抄」, name }
  * @returns {{ok:boolean, action:'speak'|'silent', say:string, because:string, why:string}}
  */
+/**
+ * 她想自己去做点什么吗？（2026-10-28 主人定的：由她的记忆决定，不由内核发牌）
+ *
+ * 三条校验：太长/太短的不收（那不是一件能做的事）；露馅词不收；抄记忆原句不收。
+ * 不合格就当作「不想」——**不替她补一件**。
+ */
+function parseWant(raw, ctx = {}) {
+  if (!raw) return null;
+  const o = typeof raw === 'string' ? { activity: raw } : raw;
+  if (!o || typeof o !== 'object') return null;
+  const activity = String(o.activity ?? o.what ?? '').replace(/\s+/g, ' ').trim();
+  if ([...activity].length < 3 || [...activity].length > 20) return null;
+  if (LEAK.test(activity)) return null;
+  const src = (ctx.sources ?? []).filter(Boolean);
+  if (src.length && longestSharedRun(activity, src) >= COPY_RUN_LIMIT) return null;
+  return { activity, why: String(o.why ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || '' };
+}
+
 export function parseSpeakVerdict(raw, ctx = {}) {
   const no = (why, because = '') => ({ ok: false, action: 'silent', say: '', because, why });
 
@@ -158,16 +186,17 @@ export function parseSpeakVerdict(raw, ctx = {}) {
   const because = String(obj.because ?? '').slice(0, 120);
   // 浅记忆先过一遍：不管说没说，她自己想的东西都该留下（但不落判断库）。
   const thoughts = cleanThoughts(obj.thoughts, ctx);
+  const want = parseWant(obj.want, ctx);
 
   if (action === 'silent' || action === 'no' || action === 'none') {
-    return { ok: true, action: 'silent', say: '', because, why: 'her_choice', thoughts };
+    return { ok: true, action: 'silent', say: '', because, why: 'her_choice', thoughts, want };
   }
-  if (action !== 'speak') return { ...no(`bad_action:${action}`, because), thoughts };
+  if (action !== 'speak') return { ...no(`bad_action:${action}`, because), thoughts, want };
 
   const say = String(obj.say ?? obj.text ?? '').replace(/\s+/g, ' ').trim();
-  if ([...say].length < SAY_MIN) return { ...no('too_short', because), thoughts };
-  if ([...say].length > SAY_MAX) return { ...no('too_long', because), thoughts };
-  if (LEAK.test(say)) return { ...no('leak', because), thoughts };
+  if ([...say].length < SAY_MIN) return { ...no('too_short', because), thoughts, want };
+  if ([...say].length > SAY_MAX) return { ...no('too_long', because), thoughts, want };
+  if (LEAK.test(say)) return { ...no('leak', because), thoughts, want };
   // 抄记忆里的原句 = 在念清单，不是在说话。
   //
   // 阈值跟 forge 的 COPY_RUN_LIMIT（8 个汉字）对齐，不在这儿另定一个数：
@@ -176,9 +205,9 @@ export function parseSpeakVerdict(raw, ctx = {}) {
   //   那种「宁可不说」不是稳，是哑。
   const src = (ctx.sources ?? []).filter(Boolean);
   const copied = src.length ? longestSharedRun(say, src) : 0;
-  if (copied >= COPY_RUN_LIMIT) return { ...no(`copied:${copied}`, because), thoughts };
+  if (copied >= COPY_RUN_LIMIT) return { ...no(`copied:${copied}`, because), thoughts, want };
 
-  return { ok: true, action: 'speak', say, because, why: 'ok', thoughts };
+  return { ok: true, action: 'speak', say, because, why: 'ok', thoughts, want };
 }
 
 /**

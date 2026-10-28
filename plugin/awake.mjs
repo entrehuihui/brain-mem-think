@@ -180,6 +180,9 @@ export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth 
   });
 
   const thoughts = Array.isArray(v.thoughts) ? v.thoughts : [];
+  // ★ 2026-10-28（主人定的）：想不想自己去做点什么，跟「说不说」是两件事。
+  //   她说不想做事就 null——**不替她补一件**。
+  const want = v.want ?? null;
 
   if (!v.ok || v.action !== 'speak') {
     return {
@@ -189,6 +192,7 @@ export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth 
       why: v.why,
       ledger: g.ledger,
       thoughts,
+      want,
       asked: true,
       // 模型的原话留一小段：出问题时能看见她到底回了什么
       raw: v.raw,
@@ -202,6 +206,7 @@ export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth 
     because: v.because,
     ledger: g.ledger,
     thoughts,
+    want,
     asked: true,
     hash: hashSay(v.say),
   };

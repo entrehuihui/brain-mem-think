@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.recall.1';
+const BUILD = '2026-10-28.want.1';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -956,12 +956,20 @@ export function apply(ctx, config = {}) {
 
       // ② 算冲动
       const notes = typeof mindInst.notes === 'function' ? mindInst.notes() : [];
+      // ★ 2026-10-28（无聊也是理由）：最近一次「有新东西」是什么时候——
+      //   判断变了，或者多了一件经历，都算。都没有超过 4 小时，就是无聊了。
+      const lastFreshAt = Math.max(
+        0,
+        ...(Array.isArray(mindInst.episodes) ? mindInst.episodes.map((e) => Number(e.at) || 0) : []),
+        ...((mindInst.store?.list ?? []).map((b) => Number(b.updatedAt ?? b.createdAt) || 0)),
+      );
       // recent：今天已经去过哪。给 urges 用来「让位」，别让同一条悬案天天霸榜。
       const list = urges({
         notes,
         preferences: st.preferences,
         recent: Array.isArray(st.budget?.recentActs) ? st.budget.recentActs : [],
         now,
+        lastFreshAt,
       });
       if (!list.length) { trace('act-idle', { why: 'no_urge' }); return false; }
       const urge = list[0];
@@ -1379,6 +1387,7 @@ export function apply(ctx, config = {}) {
             why: plan.because,
             byHer: plan.why ?? null,
             thoughts: Array.isArray(plan.thoughts) ? plan.thoughts : null,
+          want: plan.want ?? null,
             raw: plan.raw ?? null,
           });
           applyWake(storePath, {
