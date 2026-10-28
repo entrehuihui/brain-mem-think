@@ -200,5 +200,31 @@ console.log('\n[⑦] 联想（旧事并置，不靠喂）');
   ok('联想失败不许拖垮 tick', /associate-failed/.test(plugSrc));
 }
 
+// ── ⑧ 扎心度：被戳到的那一下，不该因为只发生过一次被算轻 ─────────
+console.log('\n[⑧] 扎心度（独立于次数的情绪权重）');
+{
+  const { stingOf, shielded, weightWithSting } = await imp('src/sting.mjs');
+  const NOW = Date.now();
+  const D = 86400e3;
+  const b = { id: 'b', themeKey: 'can_stand|他', subject: '他' };
+  const one = [{ at: NOW - D, who: '他', themeKey: 'can_stand|他', arousal: 0.9 }];
+  const ten = Array.from({ length: 10 }, (_, i) => ({ at: NOW - (i + 1) * 3600e3, who: '他', themeKey: 'can_stand|他', arousal: 0.2 }));
+  ok('一次 0.9 > 十次 0.2（次数不加分）', stingOf(b, one, { now: NOW }) > stingOf(b, ten, { now: NOW }));
+  ok('没有关联经历就是 0（不猜）', stingOf(b, [{ who: '母亲', themeKey: 'x|母亲', arousal: 1 }], { now: NOW }) === 0);
+  ok('护盾要两个条件同时成立', shielded({ sting: 0.9 }, { sting: 0 }) && !shielded({ sting: 0.9 }, { sting: 0.8 }));
+  ok('加成封顶 +40%', Math.abs(weightWithSting({ strength: 0.5, sting: 1 }) - 0.7) < 1e-9);
+
+  const flash = readFileSync(join(ROOT, 'src', 'flash.mjs'), 'utf8');
+  const fade = readFileSync(join(ROOT, 'src', 'fade.mjs'), 'utf8');
+  const wake = readFileSync(join(ROOT, 'src', 'wake.mjs'), 'utf8');
+  const world = readFileSync(join(ROOT, 'src', 'world.mjs'), 'utf8');
+  const mindSrc2 = readFileSync(join(ROOT, 'src', 'mind.mjs'), 'utf8');
+  ok('判断出门时带着 sting', /sting: Number\(b\.sting/.test(flash));
+  ok('fade 用扎心度排序 + 护盾', fade.includes('weightWithSting') && fade.includes('shielded(weakest'));
+  ok('wake 的 burden 认扎心度', wake.includes('weightWithSting'));
+  ok('world 排序认扎心度', world.includes('weightWithSting'));
+  ok('落盘前重算扎心度', /persist\(\)[\s\S]{0,700}refreshSting\(\)/.test(mindSrc2));
+}
+
 console.log(`\n==== ${fail === 0 ? '全绿' : '有红'}：${pass} 通过 / ${fail} 失败 ====\n`);
 process.exit(fail === 0 ? 0 : 1);

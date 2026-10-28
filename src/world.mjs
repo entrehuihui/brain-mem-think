@@ -17,6 +17,7 @@
 import { STATUS } from './judge.mjs';
 import { clause, linesOf, toNote } from './flash.mjs';
 import { episodeLines } from './episode.mjs';
+import { weightWithSting } from './sting.mjs';
 
 export const WORLD_DEFAULTS = Object.freeze({
   // ★ 2026-10-27 大乔调（主人点破的：库里有 12 条现役，她只看得见一半）。
@@ -50,7 +51,8 @@ export function isAboutSelf(n) {
 
 /** 一条判断在她心里的份量：strength（证据算出来的）优先，老数据回退 weight。 */
 function mag(n) {
-  return Number(n?.strength ?? n?.weight) || 0;
+  // ★ 2026-10-28（阶段三）：扎心的排前面。
+  return weightWithSting(n);
 }
 
 /** 心境是从判断现算的：不存，每次睁开眼重新算。 */

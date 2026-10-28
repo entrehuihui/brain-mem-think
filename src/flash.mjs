@@ -50,6 +50,9 @@ export function toNote(b) {
     // ★ 2026-10-28：底气（证据算出来的）和 weight（模型觉得多重）分开给。
     //   所有决策读 strength；weight 留着只为审计「模型偏了多少」。
     strength: b.strength ?? b.weight ?? 0,
+    // ★ 2026-10-28（阶段三）：扎心度跟着判断一起出门。
+    //   fading / wake / world 都读它——不带上，这一层就只是个存着的数。
+    sting: Number(b.sting ?? 0),
     status,
     from: b.turns.length,
     createdAt: b.createdAt,

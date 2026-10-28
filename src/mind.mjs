@@ -39,6 +39,7 @@ import { eventFromBelief, eventFromJson, makeEvent } from './event.mjs';
 import { induce, reconcile } from './induct.mjs';
 import { addEpisode, episodeLines, pruneEpisodes } from './episode.mjs';
 import { buildAssocPrompt, findPatterns, parseAssoc } from './associate.mjs';
+import { stingOf } from './sting.mjs';
 
 /** 批次的临时分组键：还没熔出判断的材料暂时放在一起记账，它永远不落到任何一条判断上。 */
 const ORPHAN = '\u0000orphan';
@@ -153,6 +154,25 @@ export class Mind {
         }
       } catch { /* 读不回来就当新装，绝不因此起不来 */ }
     }
+    // ★ 2026-10-28（阶段三）：加载完立刻算一次扎心度。
+    //   只在 persist 里算的话，重启之后到第一次落盘之间的那段时间里
+    //   `sting` 是 undefined —— 排序、护盾、burden 全都当它是 0，
+    //   等于「重启后暂时不扎心」。实测就这么吃了一惊。
+    if (this.episodes.length) this.refreshSting();
+  }
+
+  /**
+   * ★ 2026-10-28（阶段三·扎心度）：重算每条判断的扎心度。
+   *
+   * 它不由模型给，也不由次数算——只从**关联经历**的 arousal 里取最大值。
+   * 没有关联经历就是 0（不知道），不许拿 weight 顶上。
+   */
+  refreshSting() {
+    const now = this.now();
+    for (const b of this.store.list) {
+      b.sting = stingOf(b, this.episodes, { now });
+    }
+    return this.store.list.length;
   }
 
   /** 把当前判断库写回盘。没注入 io 就是空操作。 */
@@ -163,6 +183,9 @@ export class Mind {
     // ★ 2026-10-28（经历层）：经历也搭这趟车，和判断同一次原子写。
     //   分两个文件写会出现「判断落盘了、经历没落盘」的半份状态，跨重启就对不上。
     this.store.episodes = Array.isArray(this.episodes) ? this.episodes.slice(-this.episodeMax) : [];
+    // ★ 2026-10-28（阶段三）：落盘前重算扎心度——它跟着经历走，
+    //   经历一变（新增/合并/过期），判断的扎心度就得跟着变。
+    this.refreshSting();
     try { return this.io.save(this.store) === true; } catch { return false; }
   }
 
@@ -924,6 +947,13 @@ export class Mind {
     //   一段对话完全可能只发生了一件事、但没有熔出新判断；
     //   如果挂在「judgments.length > 0」后面，那种日子就整段丢掉了。
     const eps = Array.isArray(result?.episodes) ? result.episodes : [];
+    // ★ 2026-10-28（阶段三）：给这一批经历补主题键——扎心度靠它把经历接到判断上。
+    //   同一批材料里第一条判断的主题就是这摊事的主题；对象对得上才补，对不上不硬套。
+    const firstJ = Array.isArray(result?.judgments) ? result.judgments[0] : null;
+    const batchTheme = firstJ ? `${firstJ.relation}|${firstJ.subject}` : null;
+    for (const e of eps) {
+      if (!e.themeKey && batchTheme && String(e.who ?? '') === String(firstJ.subject ?? '')) e.themeKey = batchTheme;
+    }
     for (const e of eps) {
       this.episodes = addEpisode(this.episodes, e, {
         now: this.now(),

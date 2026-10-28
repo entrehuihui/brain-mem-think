@@ -15,6 +15,7 @@
  */
 
 import { clamp01, RETIRE_REASON, STATUS } from './judge.mjs';
+import { shielded, weightWithSting } from './sting.mjs';
 
 export const FADE_DEFAULTS = Object.freeze({
   pressure: 4,        // 现役判断的份量加起来超过这个数，就要有人腾位置
@@ -95,6 +96,14 @@ export function decide(incoming, notes, opts = {}) {
   //      她凭什么要等到「攒够 4」才肯放手那件零碎的？那不是脑子，是仓库。
   //
   //    E1（容量没满不许让位）仍然由 evictRatio=1.0 守住：比它重的才腾得动人。
+  //
+  // ★ 2026-10-28（阶段三·扎心护盾）：被戳到过的事，不能被一件平淡的新事挤走。
+  //   条件是双重的：它自己够扎心（≥0.75），而且新来的明显不够（差 ≥0.3）。
+  //   只判前一半会变成「永远不改」；只判后一半会变成「新事一来旧的都得走」。
+  //   这一条在 E1 之前：E1 判「够不够重」，这里判「该不该被挤」，两回事。
+  if (shielded(weakest, incoming)) {
+    return { dropped, droppedWhy, droppedKind, because, becauseIds, becauseNote, verdict: 'shielded', room: room() };
+  }
   if (incValue > value(weakest, now, o) * o.evictRatio) {
     free(weakest);
     return { dropped, droppedWhy, droppedKind, because, becauseIds, becauseNote, verdict: 'made_room', room: room() };
@@ -128,9 +137,10 @@ export function value(note, now = Date.now(), opts = {}) {
   // ★ 2026-10-28：份量改成读 strength（证据算出来的），不再读 weight（模型给的数）。
   //   原来还有一项 `sourced = 0.5 + (turns.length-1)*0.1`，那是把「几条材料撑着」
   //   又算了一遍——而 support 已经在 strength 里了。两项乘，会把份量压得莫名其妙。
-  const w = clamp01(note?.strength ?? note?.weight, 0);
+  // ★ 2026-10-28（阶段三）：扎心的更值钱（最多 +40%）——
+  //   被戳到过的事，占的位置本来就该更值钱，这跟见过几回无关。
   const reason = note?.why && [...note.why].length >= 4 ? 1 : 0.5;
-  return w * reason;
+  return weightWithSting(note) * reason;
 }
 
 export function isForgotten(note) {

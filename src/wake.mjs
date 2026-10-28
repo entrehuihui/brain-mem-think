@@ -22,6 +22,7 @@
  */
 
 import { STATUS } from './judge.mjs';
+import { weightWithSting } from './sting.mjs';
 import { hashSayText } from './speak.mjs';
 
 export const WAKE_DEFAULTS = Object.freeze({
@@ -121,7 +122,9 @@ export const hashSay = hashSayText;
 
 /** 一条判断在她心里的份量：strength（证据算出来的）优先，老数据回退 weight。 */
 function magnitude(n) {
-  return Number(n?.strength ?? n?.weight) || 0;
+  // ★ 2026-10-28（阶段三）：扎心的事压得更重。
+  //   strength 管「信不信」，sting 管「放不放得下」——burden 是后者该管的事。
+  return weightWithSting(n);
 }
 
 /** 心事有多重：压着的判断越多越重，悬着的更重（想不明白才惦记）。 */

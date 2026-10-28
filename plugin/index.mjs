@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.associate.1';
+const BUILD = '2026-10-28.sting.1';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -818,6 +818,9 @@ export function apply(ctx, config = {}) {
     //   一个是「把数出来的东西说成人话」，一个是「把两件旧事摆在一起」，
     //   共用一个时间戳的话，谁先跑谁就把另一个人挤掉。
     let lastAssociateAt = 0;
+    // 扎心度的心跳：每 10 分钟记一行「此刻最扎心的是哪条」。
+    // 不加这一行，部署完根本看不出这一层有没有活着——又一个「改了没通」。
+    let lastStingTraceAt = 0;
     const adoptInduced = async (mindInst) => {
       if (!cfg.adoptInduction) return 0;
       if (!synth || typeof synth.ask !== 'function') return 0;
@@ -1288,6 +1291,22 @@ export function apply(ctx, config = {}) {
           }
         } catch (err) {
           trace('associate-failed', { err: String(err?.message ?? err).slice(0, 140) });
+        }
+
+        // ★ 2026-10-28（阶段三）：扎心度的心跳。
+        try {
+          if (Date.now() - lastStingTraceAt >= 600_000) {
+            lastStingTraceAt = Date.now();
+            const top = [...(m.store.list ?? [])].sort((a, b) => (Number(b.sting) || 0) - (Number(a.sting) || 0))[0];
+            trace('sting-top', {
+              id: top?.id ?? null,
+              sting: Number(top?.sting ?? 0),
+              epic: Array.isArray(m.episodes) ? m.episodes.length : 0,
+              text: String(top?.text ?? '').slice(0, 28),
+            });
+          }
+        } catch (err) {
+          trace('sting-failed', { err: String(err?.message ?? err).slice(0, 120) });
         }
 
         const state = readWake(storePath);
