@@ -112,5 +112,34 @@ console.log('\n[④] 渲染（她实际看得见的那些字）');
   }
 }
 
+// ── ⑤ 「可见 = 未熔」：遮蔽与并发闸的两条不变量 ─────────────────────
+//
+// 2026-10-28 加的。它们都属于「改完看着对、其实没生效」那一类：
+//   · 遮蔽的规则曾经是「永远留最后几条原文」——熔完她还在拿上一轮原文当上下文；
+//   · tick 的成功路径忘了给 inFlight 复位——第一跳之后每一拍都被跳过，
+//     日志里 tick-alive 恒为 n:1，看起来还活着，其实只醒过一次。
+console.log('\n[⑤] 遮蔽与并发闸的不变量');
+{
+  const { planFullShadow } = await imp('plugin/shadow-plan.mjs');
+  const p = planFullShadow([10, 11, 12, 13], new Map());
+  ok('切法是「system 之后整段遮」', JSON.stringify(p?.shadow) === JSON.stringify([11, 12, 13]), JSON.stringify(p));
+
+  const src = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+
+  // ① 所有遮蔽调用都必须带 full:true（不许再回到「留最后几条」）
+  const calls = [...src.matchAll(/compactChannel\([^)]*\)/g)].map((m) => m[0]);
+  const naked = calls.filter((c) => !c.includes('full: true') && !c.includes('mindInst, opt'));
+  ok('每处遮蔽调用都写了 { full: true }', naked.length === 0, naked.join(' | '));
+  ok('遮蔽至少有一处真实调用', calls.length >= 2, 'calls=' + calls.length);
+
+  // ② 熔成功后水位必须归零（否则遮掉之后旧水位会漏掉新话）
+  ok('熔成功后把水位归零', /if \(shadowed\) writeCursor\(cursorPath, CHANNEL_SESSION_ID, 0\)/.test(src));
+
+  // ③ 并发闸：成功返回也要复位 inFlight
+  const tail = src.slice(src.indexOf('clearTimeout(hardTimer)'));
+  ok('next() 的成功路径复位了 inFlight', /inFlight = false;/.test(tail.slice(0, 400)));
+  ok('tick 保命计时器没有被 unref', !/hardTimer[\s\S]{0,120}unref\(\)/.test(src));
+}
+
 console.log(`\n==== ${fail === 0 ? '全绿' : '有红'}：${pass} 通过 / ${fail} 失败 ====\n`);
 process.exit(fail === 0 ? 0 : 1);

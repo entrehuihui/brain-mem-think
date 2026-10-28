@@ -70,6 +70,28 @@ session.append('user/message', 记忆文本, {
 
 实测效果：**128 个可见节点 → 9 个**。
 
+#### ③' 2026-10-28：熔完就遮，原文一条不留
+
+上面那一版的刀口是「**永远留住最后几条原文**」。于是她下一轮拿到的是
+「记忆 + 上一轮你的原话 + 她自己上一轮的回话」——有记忆，但仍然是基于上下文在想。
+
+现在的不变量只有一条：
+
+```
+可见 = 未熔        熔成功 → 从 system 之后整段遮掉，只留一条记忆
+                  没熔成功 → 一个字都不遮（材料留着下一跳重熔）
+```
+
+- 切法在 `plugin/shadow-plan.mjs`（纯函数，`tests/smoke_full_shadow.mjs` 钉住 6 种切法：
+  数组乱序、未收尾的 tool/call、成对工具、只剩 system……）
+- 引擎水位跟着归零（`writeCursor(..., 0)`）：遮掉之后「可见的主人消息」就是「还没熔的」
+- 实测（2026-10-28 15:30）：`turn-end-hook` → `channel-digest-from-turn-end` →
+  `channel-digest-start` → `channel-digest-done judgments:1` → `compact-ok shadowed:67 kept:0`；
+  解开她的会话文件看，surface 只剩 `[system, 记忆节点]`，**主人原文 0 条**。
+- 一个坑：`turn/end` 事件正在被宿主发布时，**同步** append 会被拒
+  （`cannot reenter while another append is being published`），
+  所以「唤醒轮没有主人消息」那一刀的遮蔽必须 `setTimeout` 挪出事件栈。
+
 ### ④ 说
 
 `followup` 投进去之后她会跑一整轮，**那一轮有全套工具和技能目录**——所以能真去出图、真去查资料，不是只会回话。

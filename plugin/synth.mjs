@@ -133,7 +133,7 @@ function pickModel(defaultModel, cfg, llm) {
  *   英文内心推演当成「她的判断」交给了内核。
  *   **推理块只计数，绝不采用。**
  */
-async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs: tmo, onReply, onError }) {
+async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs: tmo, effort, onReply, onError }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), tmo);
   let out = '';
@@ -161,6 +161,12 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
       system,
       messages: [{ role: 'user', content: [{ type: 'text', text }] }],
       maxTokens: cap,
+      // ★ 2026-10-28（熔出 0 条的真因）：推理模型的思考也吃 maxTokens。
+      //   默认档位下，一条「整理记忆」的任务能把 4000 token 全烧在 reasoning 上，
+      //   正文一个字不出——日志是 `synth-reply len:0 reasoned:12998`，
+      //   于是 fresh=1 却 judgments=0，记忆永远不涨。
+      //   熔是机械活（按给定 schema 输出 JSON），不需要深度推理：给 low。
+      ...(effort ? { reasoningEffort: effort } : {}),
       signal: controller.signal,
     });
     for await (const chunk of stream) {
@@ -223,6 +229,9 @@ export function createSynth(scope, cfg = {}, onError = null) {
   //   实测 reasoning-delta 443 块、text-delta 0 块。给到 4000，让它先想完再说。
   const maxTokens = Number(cfg.synthMaxTokens ?? 4000);
   const timeoutMs = Number(cfg.synthTimeoutMs ?? 45_000);
+  // 熔用低推理档：它是机械活，思考烧掉预算就交不出 JSON（见 streamText 里的注释）。
+  // 她自己说话（ask）不降档——那是她在想事情。
+  const digestEffort = cfg.digestReasoningEffort ?? 'low';
   // 模型原话的回调。**必须留**：今天一整天最难查的就是「模型回了什么」——
   // 材料进没进去有 owners 可看，模型说没说就只剩这一行。
   const onReply = typeof cfg.onReply === 'function' ? cfg.onReply : null;
@@ -269,6 +278,7 @@ export function createSynth(scope, cfg = {}, onError = null) {
         route,
         maxTokens,
         timeoutMs,
+        effort: digestEffort,
         onReply,
         onError,
       });

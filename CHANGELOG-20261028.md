@@ -217,8 +217,8 @@ reasoning 模型 600 token 全烧在思考上，正文一个字不出（`len:0`�
 |---|---|
 | `turn/end` 钩子挂上 | ✅ `turn-hook-armed` |
 | 钩子触发 | ✅ `turn-end-hook` |
-| 立刻遮蔽 | ✅ `compact-ok` |
-| **立刻熔** | ❌ **从未成功** |
+| 立刻遮蔽 | ✅ `compact-ok`（2026-10-28 15:30 已改成「整段遮、原文一条不留」） |
+| **立刻熔** | ✅ **2026-10-28 15:30 真跑通**（见 §十一） |
 
 原因：`turn/end` 那一刻 `agent.status` 还是 `running`，而 `digestChannelIncrement` 入口有 idle 闸，把自己挡死：
 
@@ -226,7 +226,7 @@ reasoning 模型 600 token 全烧在思考上，正文一个字不出（`len:0`�
 channel-digest-skip  why:"agent-busy" status:"running"
 ```
 
-**已修**（`fromTurnEnd: true` 跳过 idle 闸），**但还没重启验证**。
+**已修**（`fromTurnEnd: true` 跳过 idle 闸），**并于 2026-10-28 15:30 实测跑通**（§十一）。
 
 重启后应看到：
 
@@ -287,3 +287,54 @@ node replay.mjs 2 54 reuse    跳过熔，只跑模拟
 | 记忆没长 | `digest-owners` 的 `owners` / `chars` |
 
 **PS 5.1 的坑**：`Get-Content` 按 GBK 读 UTF-8 文件会把中文变乱码，`ConvertTo-Json` 可能写出空文件。**改带中文的 JSON 一律用 node。**
+
+---
+
+## 十一、2026-10-28 晚：每轮熔真跑通 + 原文一条不留
+
+> 主人原话：「先动那个每次对话都融的——那才是自由思考的关键，而不是基于上下文。」
+>
+> 改动文件：`plugin/index.mjs`、`plugin/synth.mjs`、新增 `plugin/shadow-plan.mjs`、
+> `tools/verify.mjs`、新增 `tests/smoke_full_shadow.mjs`、`tests/smoke_tick_inflight.mjs`。
+> 构建标记：`mind-build: 2026-10-28.full-shadow.4`。
+
+### 11.1 三个真问题（都不是"看着像"的问题）
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 她看起来活着，其实**装好之后只醒过一次** | `next()` 里 tick 成功返回时，finally 只 `schedule()`，**没给 `inFlight` 复位** → 之后每一拍都被并发闸跳过（日志 `tick-alive` 恒为 n:1、`tick-timeout` 从不出现） | finally 里补 `inFlight = false`。A/B 实测：修前 n=1、修后 n=1,2 |
+| 2 | 熔完她还在拿上一轮原文当上下文 | 遮蔽规则是「永远留住最后几条原文」；实测 surface = `[system, 记忆, 两条 assistant, 一条主人原话, 注入]` | 不变量改成 **可见 = 未熔**：熔成功 → system 之后整段遮；没熔 → 一个字不遮 |
+| 3 | 熔出来 **0 条**（`synth-reply len:0 reasoned:12998`） | 推理模型的思考也吃 `maxTokens`；默认档位下 4000 token 全烧在 reasoning 上，正文一个字不出 | 熔这一问降档 `reasoningEffort: 'low'`（她自己说话不降档） |
+
+### 11.2 顺带修掉的两个坑
+
+- **水位漂移**：cursor 记的是「可见的主人消息条数」，而遮蔽会让这个数变小 → 每轮 `reset:true`。
+  现在「遮掉之后水位归零」，可见的即未熔的。
+- **append 重入**：`turn/end` 事件正在被宿主发布时同步 append 会被拒
+  （`compact-failed: session append cannot reenter while another append is being published`）。
+  唤醒轮那一刀改成 `setTimeout(..., 1200)` 挪出事件栈。
+
+### 11.3 实测证据（生产日志 + 会话文件）
+
+```
+07:30:13 turn-end-hook            turn:9 aborted(user)
+07:30:13 channel-digest-from-turn-end  {"skipIdleGate":true}
+07:30:13 channel-digest-start     fresh:1 total:1
+07:30:21 channel-digest-done      judgments:1  cursorAdvanced:true
+07:30:21 compact-ok               shadowed:67 startSeq:131 endSeq:367 kept:0
+```
+
+解开 `session-96c96e2e…` 的会话文件重放 surface：
+
+```
+最终 surface 节点数 3：system/message · mind-compact（记忆）· assistant/message（当前轮）
+可见的「主人原文」条数：0
+```
+
+### 11.4 还有一处已知不一致（留给接手的人）
+
+`compact-ok` 事件里 `sourceEventSeqs` 是 62 条，而宿主自己算出的遮蔽区间是 67 个节点
+（差的那几只是本轮的 system/agent-instructions/runtime-context/skill-catalog/time-context 注入节点）。
+当前宿主容忍（append 成功、遮蔽生效），但 dsh-session 的 `assertSourceEventReferences`
+语义是「必须覆盖每一个被遮蔽的节点」——**宿主升级后这里可能开始报错**，届时要按它报的
+missing 列表补齐，别把这一条当成"已经没问题"。

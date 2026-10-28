@@ -36,6 +36,7 @@ import { planWake, applyWake, resetTalkState } from './awake.mjs';
 import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
 import { installModelSelection } from './selection.mjs';
 import { readCursors, writeCursor, sliceFresh } from './digest-cursor.mjs';
+import { planFullShadow } from './shadow-plan.mjs';
 import { readChannel, writeChannel, defaultChannelPath } from './channel-store.mjs';
 // ★ 2026-10-28（阶段 F）：主动性。她自己想去做一件事，就真的让她去。
 import { urges, actLine, selfReminder } from '../src/motive.mjs';
@@ -103,6 +104,12 @@ const CHANNEL_ID_RE = /^session-[0-9a-f-]{8,}$/i;
 const FALLBACK_CHANNEL_ID = 'session-e18b264f-41f5-454b-b1eb-0f814cdd9c5c';
 let CHANNEL_SESSION_ID = null;
 const MIND_TAG = '<mind>';
+
+/**
+ * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
+ * 「这次跑的是不是新代码」唯一能当场核对的证据。
+ */
+const BUILD = '2026-10-28.full-shadow.4';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -217,6 +224,10 @@ export function apply(ctx, config = {}) {
     LOG_PATH = join(ROOT, '.mind', 'mind.log');
   } catch { LOG_PATH = null; }
   trace('apply-entered', { hasCtx: !!ctx, cfgKeys: Object.keys(config || {}) });
+  // ★ 2026-10-28：每次加载写死一个构建标记。
+  //   日志里分不清「跑的是哪一版」这件事，今天已经害我猜了三回
+  //   （改了没生效 / 生效了但被旧模块缓存挡住）。以后看这一行就知道。
+  trace('mind-build', { build: BUILD });
   process.stderr.write('mind: apply() entered\n');
   const cfg = resolveConfig(config);
   // 通道 id 允许在配置里覆盖（换机器、换人设都可能要换）
@@ -699,17 +710,36 @@ export function apply(ctx, config = {}) {
       const owners = ownerMessages(session.deriveMessages());
       if (!owners.length) {
         trace('channel-digest-skip', { why: 'no-owner-messages' });
+        // ★ 唤醒轮：这一轮没有主人的话要熔，但 surface 上还留着她自己的唤醒词和回话。
+        //   它们不是记忆材料，下一轮也不该带着——turn/end 这一路直接遮掉。
+        //
+        // ★ 2026-10-28 实测（`compact-failed: session append cannot reenter while
+        //   another append is being published`）：turn/end 事件本身正在被宿主发布，
+        //   **同步** append 会被拒。所以这一刀必须挪出事件栈，等发布完再下。
+        if (opt.fromTurnEnd) {
+          setTimeout(() => {
+            try { compactChannel(session, mindInst, { full: true }); } catch (err) {
+              trace('compact-deferred-failed', { err: String(err?.message ?? err).slice(0, 140) });
+            }
+          }, 1200);
+        }
         return;
       }
       // ★ 2026-10-28（阶段 F）：主人在说话，时钟往前走。她这十分钟不许出门。
       lastOwnerMessageAt = Date.now();
 
       const cursors = readCursors(cursorPath);
-      const { fresh, total, reset } = sliceFresh(owners, cursors[CHANNEL_SESSION_ID] ?? 0);
+      const { fresh, total, reset, cursor } = sliceFresh(owners, cursors[CHANNEL_SESSION_ID] ?? 0);
       if (!fresh.length) {
-        // 没新话可熔，但历史还堆在那儿 —— 照样把它换成记忆。
-        // （每轮请求因此只带：系统提示 + 一条「我记得的事」+ 你新说的这句）
-        compactChannel(session, mindInst);
+        // 没新话可熔。
+        //
+        // ★ 2026-10-28（可见即未熔）：之前熔过（cursor > 0）却还有可见的主人原文，
+        //   说明它那条遮蔽当时没成——这一跳补遮掉，别让它一直挂在她上下文里。
+        //   从没熔过（cursor = 0）就一个字都不遮：材料还没进记忆，遮了等于吞掉你的话。
+        if (cursor > 0) {
+          const shadowed = compactChannel(session, mindInst, { full: true });
+          if (shadowed) writeCursor(cursorPath, CHANNEL_SESSION_ID, 0);
+        } else trace('channel-digest-nothing', { total, cursor });
         return;
       }
 
@@ -738,8 +768,15 @@ export function apply(ctx, config = {}) {
           reason: out?.reason ?? null,
           cursorAdvanced: n > 0,
         });
-        // 熔完立刻把上下文换掉：下一轮模型只看见记忆 + 最近几句原话。
-        compactChannel(session, mindInst);
+        // ★ 熔完立刻整段遮蔽：下一轮模型只看见「系统提示 + 一条记忆」，原文一条不留。
+        //   这一步才是「一次对话 = 一次融合」的后半句——只熔不遮，
+        //   她下一轮仍然在拿原文当上下文。
+        if (n > 0) {
+          const shadowed = compactChannel(session, mindInst, { full: true });
+          // ★ 水位归零：遮掉之后，可见的主人消息就是「还没熔的」，
+          //   条数水位必须跟着归零，否则下一次会拿旧水位去切新列表、把新话漏掉。
+          if (shadowed) writeCursor(cursorPath, CHANNEL_SESSION_ID, 0);
+        }
       } catch (err) {
         // 抛错也不推进游标 —— cursor 只在「真的熔成了」时前进。
         trace('channel-digest-failed', { err: String(err?.message ?? err).slice(0, 160) });
@@ -1004,7 +1041,9 @@ export function apply(ctx, config = {}) {
             //   所以显式告诉它：这一路不用看 status。
             await digestChannelIncrement(m, { fromTurnEnd: true });
             const live = sessions.get(CHANNEL_SESSION_ID);
-            if (live) compactChannel(live, m);
+            // 遮蔽已经由 digestChannelIncrement 在「熔成功」之后做掉了（整段遮）。
+            // 这里不再补一刀——没熔成功的时候遮掉 = 把主人的话吞了。
+            void live;
           } catch (err) {
             trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
           }
@@ -1034,7 +1073,23 @@ export function apply(ctx, config = {}) {
      *
      *   失败不抛：遮蔽不成功最多是「还带着上下文」，不该把她的话搞没。
      */
-    const compactChannel = (session, mindInst) => {
+    /**
+     * 把会话的可见历史换成一条「融合后的记忆」——**只在熔成功之后**下这一刀。
+     *
+     * ★ 2026-10-28 按主人那句「每次对话都融」重写。
+     *
+     *   原来是「永远留住最后几条原文」：熔完只遮更早的，最后一条主人原话、
+     *   她上一轮的回话、本轮的注入节点全部留着。于是她下一轮拿到的是
+     *   「记忆 + 上一轮你的原话 + 她自己的回话」——有记忆，但仍然是基于上下文在想。
+     *
+     *   现在的不变量只有一条：**可见 = 未熔；熔过的原文一律不再出现。**
+     *     · 熔成功 → 从 system 之后整段遮掉，只留一条记忆节点
+     *     · 没熔成功 → 一个字都不遮（材料留着下一跳重熔，宁可堆着也不吞掉你的话）
+     *
+     *   切法在 plugin/shadow-plan.mjs 里纯函数算好，配了单测；
+     *   这里只负责 append。
+     */
+    const compactChannel = (session, mindInst, opt = {}) => {
       try {
         if (!session) { trace('compact-skip', { why: 'no-session' }); return false; }
         if (typeof session.append !== 'function') { trace('compact-skip', { why: 'no-append' }); return false; }
@@ -1042,128 +1097,26 @@ export function apply(ctx, config = {}) {
         if (!surface) { trace('compact-skip', { why: 'no-surface' }); return false; }
         const nodes = surface.nodes ?? [];
         if (!Array.isArray(nodes)) { trace('compact-skip', { why: 'nodes-not-array', kind: typeof nodes }); return false; }
-        // ★ surface.nodes 是 **seq 数字的数组**，不是节点对象
-        //   （dsh-session:464 `state.nodes.push(plan.seq)`）。
-        //   我第一次写成 `n?.seq`，88 个节点全取成 undefined——
-        //   实测 compact-probe {"nodes":88,"seqs":0}，然后被 only-system 挡掉。
-        //   两种形状都收，免得以后再踩。
+        // surface.nodes 是 seq 数字的数组（dsh-session：state.nodes.push(plan.seq)），两种形状都收。
         const seqs = nodes.map((n) => (typeof n === 'number' ? n : n?.seq)).filter((n) => Number.isInteger(n));
         trace('compact-probe', { nodes: nodes.length, seqs: seqs.length, first: seqs[0] ?? null, last: seqs[seqs.length - 1] ?? null });
-        if (seqs.length < 2) { trace('compact-skip', { why: 'only-system', n: seqs.length }); return false; }
 
-        // 想按 seq 看「这条是谁说的」，得有一张 seq → 事件 的表。
-        // 优先问 session.events（宿主的事件流）；取不到就退回「认不出 = 不是真话」，
-        // 那种情况下下面的锚定会走 KEEP 兜底，不会误遮主人那句更多。
+        if (!opt.full) { trace('compact-skip', { why: 'undigested-keep-raw' }); return false; }
+
         const bySeq = new Map();
         try {
           const evs = Array.isArray(session.events) ? session.events : (session.events?.values?.() ?? []);
           for (const e of evs) {
             if (e && Number.isInteger(e.seq)) bySeq.set(e.seq, e);
           }
-        } catch { /* 取不到就空表 */ }
-        if (!bySeq.size) trace('compact-no-events', { why: 'fallback-to-count' });
+        } catch { /* 取不到就空表；plan 会保守地不遮 pending 工具 */ }
 
-        const rest = seqs.slice(1);
-        // 只剩「系统提示 + 上一条记忆」时没什么可遮蔽的，别每跳空转一次。
-        if (rest.length < 2) { trace('compact-skip', { why: 'already-compact', rest: rest.length }); return false; }
-
-        // ★ 2026-10-27 大乔修（主人当场抓到的 bug：「原来的聊天没了」）。
-        //
-        //   原来是把 rest 整段（除了第一条 system）一次遮掉，**连主人刚说的那一句也遮**。
-        //   实测后果（archive 解法前）：
-        //     20:46 主人说「你去看看你自己长什么样子」→ 20:47 tick 熔完就遮掉，
-        //     然后这一步还没跑完，她的上下文里主人那句话已经不见了。
-        //   主人看到的就是「我刚说完你就失忆」。sessions 存档里那些 mind-compact 节点
-        //   seq 465/487/501/537/552 就是这么长出来的。
-        //
-        //   现在规则改成：**只遮「更早的」，永远留住最后几条原文**（DIGEST_KEEP_SEQS）。
-        //
-        //   ★ 2026-10-27 再修一层（实测踩到的第二个坑）：
-        //     只数「条数」不够。宿主每一轮还会往 surface 里塞 agent-instructions /
-        //     runtime-context / skill-catalog 三个注入节点，它们排在主人那句话**后面**。
-        //     按条数留 4 条，留下的正好是这三个注入 + 一条记忆，
-        //     而主人真正说的那句（seq 542）反而落在「要遮」那半截里 ——
-        //     **等于没修**。实测那一轮就是 537,542,543,544,545 全被遮。
-        //
-        //     所以判据改成：**从末尾往前，锚定最后一条 ROLE=user 的真话**，
-        //     它以及它之后的一律不遮；它之前的一律可遮。
-        //     没有真话（纯唤醒/纯注入）时退回按条数留 KEEP 条。
-        //   于是任何时刻她的上下文都是：
-        //     系统提示 + 记忆 + 你最近说的那句 + 这一轮的注入
-        //   而不是「系统提示 + 记忆」——后者等于听不见你最后说的那句。
-        const KEEP = DIGEST_KEEP_SEQS;
-        const isOwnerNode = (s) => {
-          const e = bySeq.get(s);
-          const kind = String(e?.data?.source?.kind ?? '').toLowerCase();
-          return kind === 'user';
-        };
-        // 记忆节点自己也等同于「已熔过的东西」——留着它没有意义，
-        // 因为这一跳马上又要追加一条新的。不遮它，上下文里就会叠出两条记忆。
-        const isMemoryNode = (s) => String(bySeq.get(s)?.data?.source?.kind ?? '').toLowerCase() === 'mind-compact';
-
-        // ★★ 2026-10-28 修（主人当场撞上的 400：tool calls and tool results do not match）
-        //
-        //   这段遮蔽原来是**按 seq 下标切一刀**：从 0 到 cut 全遮，之后全留。
-        //   可 tool/call 和 tool/result 在 surface 上**不是相邻的**——
-        //   一刀切下去，很可能把 call 遮掉、把 result 留下（或者反过来）。
-        //   网关一看到「有 result 没 call」，直接 400，整个会话报废，只能新建。
-        //
-        //   README 坑 25 记的是同一类事故（turn 中间插消息），我当时只在
-        //   `digestChannelIncrement` 入口加了 idle 检查，**没管遮蔽本身会不会撕裂配对**。
-        //   这一条比 idle 检查更要紧：它不看时机，切错就坏。
-        //
-        //   改法：切完再看一眼，凡是配对两半落在切痕两侧的，**整对往「留给」那半边挪**。
-        //   代价是少遮两条，换的是会话不被写坏——这个交换永远划算。
-        // ★ 2026-10-28 补回（我改撕裂保护时把这段删了，生产上直接报
-        //   `lastOwnerIdx is not defined`，遮蔽整块失效）：
-        //   从末尾往前锚定最后一条 ROLE=user 的真话；它以及它之后一律不遮。
-        let lastOwnerIdx = -1;
-        for (let i = rest.length - 1; i >= 0; i -= 1) {
-          if (isOwnerNode(rest[i])) { lastOwnerIdx = i; break; }
+        const plan = planFullShadow(seqs, bySeq);
+        if (!plan || !plan.shadow.length) {
+          trace('compact-skip', { why: plan?.blocked ?? 'nothing-to-shadow', nodes: seqs.length });
+          return false;
         }
-        let cut = lastOwnerIdx;
-        for (let i = lastOwnerIdx; i >= 0; i -= 1) {
-          if (isMemoryNode(rest[i])) { cut = i + 1; break; }
-        }
-        if (lastOwnerIdx < 0) cut = Math.max(0, rest.length - KEEP);
 
-        // 边界保护：把撕裂的 tool 配对整对挪到「留下」那侧
-        const tornPairs = [];
-        {
-          const callSeqOf = new Map();   // callId → {callSeq, resultSeq}
-          const resultOf = new Map();
-          for (const [seq, e] of bySeq) {
-            if (e?.type === 'tool/call' && e?.data?.callId) {
-              const k = String(e.data.callId);
-              if (!callSeqOf.has(k)) callSeqOf.set(k, {});
-              callSeqOf.get(k).callSeq = seq;
-            } else if (e?.type === 'tool/result' && e?.data?.message?.toolCallId) {
-              const k = String(e.data.message.toolCallId);
-              if (!callSeqOf.has(k)) callSeqOf.set(k, {});
-              callSeqOf.get(k).resultSeq = seq;
-            }
-            void resultOf;
-          }
-          for (const [, v] of callSeqOf) {
-            if (v.callSeq == null || v.resultSeq == null) continue;
-            const idxA = rest.indexOf(v.callSeq);
-            const idxB = rest.indexOf(v.resultSeq);
-            if (idxA < 0 || idxB < 0) continue;
-            const sideA = idxA < cut;
-            const sideB = idxB < cut;
-            if (sideA === sideB) continue;                 // 两半同侧，没问题
-            // 撕裂了：把整对挪到「留下」那侧 → cut 退到这一对的最小下标
-            cut = Math.min(cut, Math.min(idxA, idxB));
-            tornPairs.push({ call: v.callSeq, result: v.resultSeq, cut });
-          }
-          if (tornPairs.length) {
-            trace('compact-torn-pair-protected', { n: tornPairs.length, cut, sample: tornPairs[0] });
-          }
-        }
-        if (cut < 0) cut = 0;
-
-        const shadow = rest.slice(0, cut);
-        if (shadow.length < 2) { trace('compact-skip', { why: 'short-shadow', shadow: shadow.length, keep: KEEP, lastOwnerIdx, cut }); return false; }
         const memory = (mindInst?.world ? mindInst.world({ name: cfg.name }) : '') || '';
         if (!memory.trim()) { trace('compact-skip', { why: 'empty-memory' }); return false; }
 
@@ -1174,23 +1127,24 @@ export function apply(ctx, config = {}) {
           source: { kind: 'mind-compact' },
         };
 
-        // endSeq 可能是排他也可能是包含，两种都试一次；成功后节点就换掉了。
-        // ★ 2026-10-27 实测是**包含**（排他会报 "end seq N not found in surface"），
-        //   所以先试 lastSeq，别每跳都在日志里留一行必然失败的尝试。
-        const lastSeq = shadow[shadow.length - 1];
-        for (const endSeq of [lastSeq, lastSeq + 1]) {
-          try {
-            session.append('user/message', data, {
-              surfaceOp: { op: 'replace', startSeq: shadow[0], endSeq },
-              sourceEventSeqs: shadow,
-            });
-            trace('compact-ok', { shadowed: shadow.length, startSeq: shadow[0], endSeq, kept: KEEP });
-            return true;
-          } catch (err) {
-            trace('compact-try-failed', { endSeq, err: String(err?.message ?? err).slice(0, 140) });
-          }
+        // 宿主语义（dsh-session）：endSeq **包含**，且按数组下标找，不按数值大小。
+        try {
+          session.append('user/message', data, {
+            surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
+            sourceEventSeqs: plan.shadow,
+          });
+          trace('compact-ok', {
+            shadowed: plan.shadow.length,
+            startSeq: plan.startSeq,
+            endSeq: plan.endSeq,
+            kept: 0,
+            blocked: plan.blocked ?? null,
+          });
+          return true;
+        } catch (err) {
+          trace('compact-failed', { err: String(err?.message ?? err).slice(0, 160) });
+          return false;
         }
-        return false;
       } catch (err) {
         trace('compact-failed', { err: String(err?.message ?? err).slice(0, 140) });
         return false;
@@ -1444,6 +1398,10 @@ export function apply(ctx, config = {}) {
         })
         .finally(() => {
           clearTimeout(hardTimer);
+          inFlight = false;        // ★ 2026-10-28 修：成功返回也必须放开并发闸。
+                                   //   原来只清 timer，不给 inFlight 复位 —— 第一跳正常返回后
+                                   //   永远 inFlight=true，之后每一拍都被 skip 掉：
+                                   //   日志里 tick-alive 恒为 n:1、tick-timeout 一次都不出现。
           if (done) return;        // 硬超时已经续过了，别续两次
           done = true;
           schedule();
