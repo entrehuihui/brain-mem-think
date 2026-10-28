@@ -462,3 +462,41 @@ associate-done {tried:1, adopted:1, reason:"new"}
 `sting` 原来只在 `persist()` 里重算。重启之后、第一次落盘之前，
 `sting` 是 `undefined`——排序、护盾、burden 全当它是 0，等于「重启后暂时不扎心」。
 现在构造完就补算一次。
+
+---
+
+## 十五、2026-10-28 18:1x：情境检索（阶段四）
+
+> `world()` 原来把全部现役判断塞进上下文（maxHeld=100）。26 条还行，189 条就是灾难。
+> 人不是这么记的：当下这件事让她想起三件相关的，其余沉在水底。
+
+### 新增
+
+- `src/recall.mjs`：纯检索，不调模型
+  - **底色永远留**：身份（kind=identity）+ 悬案（open）——它们不是「相关」，是「她是她」
+  - 其余打分：Dice 字符相似 + 主题键命中（最硬）+ 对象命中 + 底气/扎心度
+  - **必须有一条硬线索才取**（文本够像 / 主题命中 / 对象命中）；不拿「底子厚」凑数
+  - 取不满就只留底色，不硬凑五条
+- `world.mjs`：给了 `focus` 只摆几条；没给退回全量（老调用方一个字不用改）
+  - 「关于我自己」那段也受检索约束——否则它又从全量里捞两条，总数照样爆
+- `plugin/index.mjs`：注入/遮蔽两处都传当前主人原话；取不到就 null（退回全量）
+- 诊断：`world-render {focus, chars, lines}`
+- 测试：`tests/smoke_recall.mjs`（14）+ `verify [⑨]`（8）
+
+### 真实证据
+
+```
+有主人消息  focus:true  → world-render {chars:671, lines:20}
+没有消息    focus:false → world-render {chars:880, lines:27}   ← 退回全量
+```
+
+### 四个阶段到这里齐了
+
+| 阶段 | 真实证据 |
+|---|---|
+| 经历层 | `digest judgments:3 / episodes:2`，落盘两条经历，第一铁律 5/6 字 |
+| 联想 | `associate-done {adopted:1}` →「他总先顾着我的感受…」，与材料 1 字 |
+| 扎心度 | `sting-top {sting:0.8, epic:3}`；真实库 0 经历时 `sting:0`（不猜） |
+| 情境检索 | `world-render {focus:true, lines:20}` vs `{focus:false, lines:27}` |
+
+验收：`verify` 51 绿、`smoke_*` 全绿、`acceptance` 25 绿 / 2 红（j 止损阀、k 未测，四轮无新增红）。
