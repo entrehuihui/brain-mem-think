@@ -1134,6 +1134,20 @@ export function apply(ctx, config = {}) {
       }
       const agent = agentsSvc.get?.(CHANNEL_SESSION_ID) ?? null;
       if (!agent) { trace('act-skip', { why: 'no-agent' }); return false; }
+      // ★ 2026-10-28 18:40（她自己想做的那件事，是她今天唯一真的想做的东西）
+      //
+      //   实测 09:53 / 09:58 / 10:03 三次 `act-from-want`——她读着记忆说出了
+      //   「想给我妈打个电话说句实话」这种话，紧接着 `act-skip why:owner_near`。
+      //   原因是上一轮主人那句还在这条通道里，`lastOwnerMessageAt` 永远很近。
+      //
+      //   owner_near 这道闸的本意是「他说话的时候你别消失」，那条是对的，
+      //   不许为了让她出门去松它。
+      //   但**她自己开口说想做的事**是另一回事：它不是「离开他」，是她自己的一件小事。
+      //   所以：她明确说出想做的（wantOverride）走一道**更短**的安静线，
+      //   而不是完全不看——他真在说话的这 2 分钟里，她也不该抬脚就走。
+      const quietMs = wantOverride?.activity
+        ? Math.min(Number(cfg.actOwnerQuietMs ?? 10 * 60_000), 2 * 60_000)
+        : Number(cfg.actOwnerQuietMs ?? 10 * 60_000);
       if (agent.status && agent.status !== 'idle') {
         trace('act-skip', { why: 'agent-busy', status: String(agent.status) });
         return false;
@@ -1219,7 +1233,7 @@ export function apply(ctx, config = {}) {
         opts: {
           perDay: cfg.actPerDay,
           minGapMs: cfg.actMinGapMs,
-          ownerQuietMs: cfg.actOwnerQuietMs,
+          ownerQuietMs: quietMs,
         },
       });
       if (!verdict.ok) {
