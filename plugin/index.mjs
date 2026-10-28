@@ -115,6 +115,18 @@ let CHANNEL_SESSION_ID = null;
  * 所以：内容没变就不写。
  */
 let lastWorldFp = '';
+
+/**
+ * ★ 2026-10-28 18:20（止血·空转 digest）：同一批材料熔空之后的冷却。
+ *
+ * 熔空而不推进 cursor 是对的（否则主人的话被悄悄吞掉），
+ * 但**同一批话每分钟重问一次模型**是另一回事：实测七次连着熔空，
+ * fresh 从 3 涨到 9，一个字没进库，模型白烧七次。
+ * 冷却期内同一个 batchKey 不再问；新话进来 batchKey 变了，立刻再审。
+ */
+const EMPTY_DIGEST_COOLDOWN_MS = 10 * 60_000;
+let lastEmptyDigestBatch = '';
+let lastEmptyDigestAt = 0;
 const MIND_TAG = '<mind>';
 
 /**
@@ -869,6 +881,25 @@ export function apply(ctx, config = {}) {
 
       const cursors = readCursors(cursorPath);
       const { fresh, total, reset, cursor } = sliceFresh(owners, cursors[CHANNEL_SESSION_ID] ?? 0);
+      // ★ 2026-10-28 18:20（止血·空转 digest）：
+      //
+      //   实测：同一批 fresh 只要熔出 0 条，cursor 就不推进（这条规矩是对的，
+      //   否则主人的话会被悄悄吞掉）；可**没有冷却**，于是每一拍都拿同一批话
+      //   再问模型一次，模型每次都给空——09:24 到 09:30 连着七次，
+      //   fresh 从 3 一路涨到 9，一个字没进库，模型白烧七次。
+      //
+      //   规矩里那条「宁可重复一次也不漏」指的是**换了材料**再试一次，
+      //   不是**同一批材料每分钟重问一次**。同一批材料反复给空，
+      //   说明这段材料确实熔不出东西——认了，等新话进来再审。
+      const batchKey = `${total}:${reset ? 'r' : ''}`;
+      if (batchKey === lastEmptyDigestBatch && now - lastEmptyDigestAt < EMPTY_DIGEST_COOLDOWN_MS) {
+        trace('channel-digest-skip', {
+          why: 'same-batch-empty',
+          total,
+          waitMs: EMPTY_DIGEST_COOLDOWN_MS - (now - lastEmptyDigestAt),
+        });
+        return;
+      }
       if (!fresh.length) {
         // 没新话可熔。
         //
@@ -901,6 +932,14 @@ export function apply(ctx, config = {}) {
         if (n > 0 || eps > 0) {
           writeCursor(cursorPath, CHANNEL_SESSION_ID, total);
         }
+        // ★ 2026-10-28 18:20（止血·空转 digest）：这一批熔空了，记住它是哪一批、什么时候。
+        //   同一批材料在冷却期内不再重问——见上面 lastEmptyDigestBatch 那段说明。
+        if (n === 0 && eps === 0) {
+          lastEmptyDigestBatch = batchKey;
+          lastEmptyDigestAt = now;
+        } else {
+          lastEmptyDigestBatch = '';
+        }
         if (n > 0 || eps > 0) markFresh(storePath, 'digest');
         trace('channel-digest-done', {
           fresh: fresh.length,
@@ -909,7 +948,9 @@ export function apply(ctx, config = {}) {
           episodes: eps,
           rawEpisodes: out?.rawEpisodes ?? null,
           reason: out?.reason ?? null,
-          cursorAdvanced: n > 0,
+          // ★ 2026-10-28 18:20 修：原来写的是 `n > 0`——判断为空、经历却有的时候
+          //   游标其实推进了，日志却报 false。证据行报假，比不报更坏。
+          cursorAdvanced: n > 0 || eps > 0,
         });
         // ★ 熔完立刻整段遮蔽：下一轮模型只看见「系统提示 + 一条记忆」，原文一条不留。
         //   这一步才是「一次对话 = 一次融合」的后半句——只熔不遮，
