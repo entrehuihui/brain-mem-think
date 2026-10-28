@@ -386,3 +386,41 @@ turn-end-hook turn:2 → channel-digest-start fresh:2
 
 同一个 YAML mapping 里写了两个 `channelSessionId`，后写的空串覆盖了前面的临时 id，
 于是「配置改了却没生效」。一个 key 只许出现一次，已写进配置注释。
+
+---
+
+## 十三、2026-10-28 17:2x：联想（阶段二）
+
+> 在这之前 `novel` 恒为 0：内核数出来的判断全部来自「从判断倒推」——
+> 模型给过什么她才会想到什么。那不是判断权，是回声。
+
+### 新增
+
+- `src/associate.mjs`
+  - `findPatterns(episodes)`：纯计数，不调模型。同一个人、情绪 ≥0.45、
+    两件旧事相隔 **≥6 小时**（不能是同一件事的两种说法）且 ≤60 天，才合成一个模式。
+  - `buildAssocPrompt(pattern)`：只给两件事的原貌，不给结论。
+  - `parseAssoc(raw)`：**谓词必须落在闭集里**，否则丢；拦阿拉伯/中文数字、超长、NULL。
+- `Mind.associate()`：模型只说一句人话 → 过 8 字抄原文闸 → 对账
+  - 库里没有同主题 → **novel**（收进来，`origin=induction`，观测 `source=association`）
+  - 有且反向 → **contested**（写进旧判断的 `tension`，不静默吞）
+  - 有且同向 → **confirmed**（加固，不重复收）
+- `adoptClaim` 的 `minSupport` 开成参数：观测归纳要 3 回（反复发生），联想只要 2 件（又发生了一次）。
+- `plugin/index.mjs`：tick 里 10 分钟节流一次，`associateEveryMs` 可配；失败只记日志不拖垮 tick。
+- 测试：`tests/smoke_associate.mjs`（23）+ `tools/verify.mjs` [⑦]（10）。
+
+### 真实模型证据（隔离验证）
+
+```
+associate-done {tried:1, adopted:1, reason:"new"}
+  text:     他总先顾着我的感受，我的心也慢慢朝他靠近。
+  themeKey: grows_toward|他
+```
+
+这条判断的原料是 **3 条经历**，不是任何现有判断；与经历材料最长公共连续 **1 字**。
+
+### 判定权在哪
+
+模型**不能**决定：「这是哪一类事」（谓词闭集由内核校验）、「见过几回」（内核数）、
+「库里有几条」（内核查）、「方向是什么」（模型给，但内核比对旧判断，反了就记冲突）。
+它只说一句人话。
