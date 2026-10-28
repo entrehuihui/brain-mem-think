@@ -37,6 +37,7 @@ import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
 import { installModelSelection } from './selection.mjs';
 import { readCursors, writeCursor, sliceFresh } from './digest-cursor.mjs';
 import { planFullShadow } from './shadow-plan.mjs';
+import * as capsuleApi from './capsule.mjs';
 import { readChannel, writeChannel, defaultChannelPath } from './channel-store.mjs';
 // ★ 2026-10-28（阶段 F）：主动性。她自己想去做一件事，就真的让她去。
 import { urges, actLine, selfReminder } from '../src/motive.mjs';
@@ -216,6 +217,12 @@ function trace(event, extra) {
  * @param {object} ctx 宿主上下文
  * @param {object} config cordis.patch.yml 那段
  */
+// ★ 2026-10-28：照账号池（wb-pool）的做法——**在文件顶层声明依赖**，
+//   宿主会等这些服务就绪再调 apply()，所以 apply 里直接 ctx.webServer 就是稳的。
+//   我原来用 ctx.get('webServer') + 自己轮询，是把宿主已经做好的事又做了一遍，
+//   而且第一次写还漏了重试 → 重启后接口 404。
+export const inject = ['webServer'];
+
 export function apply(ctx, config = {}) {
   // ★ 第一行就写盘：以后「插件没反应」这件事，第一眼就能分清
   //   「压根没进 apply」和「进了但没干活」。
@@ -229,7 +236,68 @@ export function apply(ctx, config = {}) {
   //   （改了没生效 / 生效了但被旧模块缓存挡住）。以后看这一行就知道。
   trace('mind-build', { build: BUILD });
   process.stderr.write('mind: apply() entered\n');
+
+  // ── 胶囊：把「她每一拍醒来想了什么」给本机看板读（2026-10-28）──
+  //
+  // 只读 mind.log，不另存一份：两份真相早晚对不上。
+  // 只给 loopback：它是看板，不是对外接口；不进上下文、不进判断库。
+  // ── 胶囊：把「她每一拍醒来想了什么」给本机看板读（2026-10-28）──
+  //
+  // 只读 mind.log，不另存一份：两份真相早晚对不上。
+  // 只给 loopback：它是看板，不是对外接口；不进上下文、不进判断库。
+  //
+  // ★ 2026-10-28 按账号池改：依赖写在文件顶层 `export const inject = ['webServer']`，
+  //   宿主保证 apply 时它已在，所以这里直接用 ctx.webServer，不自己轮询、不赌运气。
+  try {
+    const { readLogTail, summarize } = capsuleApi;
+    const CAPSULE_PATH = '/plugins/mind/capsule';
+    const webServer = ctx.webServer
+      ?? (typeof ctx.get === 'function' ? ctx.get('webServer') : null);
+    if (webServer && typeof webServer.register === 'function') {
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: CAPSULE_PATH,
+        handler: (req, res) => {
+          const host = String(req?.headers?.host ?? '');
+          const remote = String(req?.socket?.remoteAddress ?? '');
+          const loop = /^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/.test(remote)
+            || /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host);
+          if (!loop) {
+            res.statusCode = 403;
+            res.setHeader('content-type', 'application/json; charset=utf-8');
+            res.end(JSON.stringify({ error: 'request-not-trusted' }));
+            return;
+          }
+          let body;
+          try {
+            const events = readLogTail(LOG_PATH);
+            const s = summarize(events, { maxEntries: 40 });
+            body = {
+              build: BUILD,
+              name: cfgName,
+              counts: s.counts,
+              lastAt: s.lastAt,
+              entries: s.entries,
+              at: new Date().toISOString(),
+            };
+          } catch (err) {
+            body = { error: String(err?.message ?? err).slice(0, 160) };
+          }
+          res.statusCode = body.error ? 500 : 200;
+          res.setHeader('content-type', 'application/json; charset=utf-8');
+          res.setHeader('cache-control', 'no-store');
+          res.end(JSON.stringify(body));
+        },
+      }), 'mind.capsule');
+      trace('capsule-registered', { path: CAPSULE_PATH, via: ctx.webServer ? 'ctx.webServer' : 'ctx.get' });
+    } else {
+      trace('capsule-skip', { why: 'no-webServer' });
+    }
+  } catch (err) {
+    trace('capsule-failed', { err: String(err?.message ?? err).slice(0, 140) });
+  }
   const cfg = resolveConfig(config);
+  const cfgName = cfg.name ?? null;
 
   /**
    * ★ 2026-10-28（阶段四·情境检索）：当下这件事 = 她最近一条主人原话。
