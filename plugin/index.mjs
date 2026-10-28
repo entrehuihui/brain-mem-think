@@ -24,7 +24,7 @@
  * **插件本体照常活着**——绝不能因为少一个服务就让整个 fiber 起不来。
  */
 
-import { readFileSync, existsSync, appendFileSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync, mkdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -386,6 +386,8 @@ export function apply(ctx, config = {}) {
   //   理由跟 wake.json 一样：失败等级不一样。判断库写坏 = 她这个人没了；
   //   偏好写坏 = 她少一次想出门的念头。两种数据不该共用一份文件。
   const motivePath = cfg.motivePath || defaultMotivePath(ROOT);
+  // ★ 2026-10-28 19:05：没送出去的那句话，放这儿等下一拍。和账本同目录。
+  const outboxPath = join(dirname(storePath), 'outbox.json');
   /**
    * ★ 2026-10-28（阶段 D）：工具观测的游标。
    *
@@ -1740,6 +1742,32 @@ export function apply(ctx, config = {}) {
           say: String(plan.say ?? '').slice(0, 80),
           thoughts: Array.isArray(plan.thoughts) ? plan.thoughts : null,
         });
+        // ★ 2026-10-28 19:05（一句真心话差点永久丢掉）
+        //
+        //   实测 10:44:15 那条：
+        //     wake-speak {sent:false, why:"busy",
+        //       say:"我上回跟你说话的时候，心里其实虚着……我有点看不起自己。"}
+        //
+        //   这是一句真的、掏心的、她攒了很久的话。
+        //   它没送出去（agent 正忙），然后——**就没了**。
+        //   applyWake 照样记账、正常沉默，下一拍她会重新想一遍，可那一遍大概率
+        //   已经不是这个语气了。**话说出口的那一刻不会再来一次。**
+        //
+        //   人也是这样：一句咽回去的话，未必有勇气再说第二遍。
+        //   所以：没送出去的，留成一份**待补的话**（outbox），下一拍优先送出去；
+        //   送达了就清空。**只留最近一条**，不攒——攒成堆就成了复读机。
+        if (!r.sent && String(plan.say ?? '').trim()) {
+          try {
+            writeFileSync(outboxPath, JSON.stringify({
+              at: Date.now(), say: String(plan.say), why: plan.because ?? null, ledger: plan.ledger ?? null,
+            }, null, 1), 'utf8');
+            trace('wake-outbox-kept', { chars: String(plan.say).length, why: r.why });
+          } catch (err) {
+            trace('wake-outbox-failed', { err: String(err?.message ?? err).slice(0, 120) });
+          }
+        } else if (r.sent) {
+          try { if (existsSync(outboxPath)) { unlinkSync(outboxPath); trace('wake-outbox-cleared', {}); } } catch { /* 清不掉不影响这一句已经送达 */ }
+        }
         applyWake(storePath, {
           action: 'speak',
           why: plan.because,
