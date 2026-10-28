@@ -37,6 +37,7 @@ import { digestSession as runDigest, commitDigest } from './digest-session.mjs';
 import { strengthOfBelief, strengthFromEvidence } from './strength.mjs';
 import { eventFromBelief, eventFromJson, makeEvent } from './event.mjs';
 import { induce, reconcile } from './induct.mjs';
+import { addEpisode, episodeLines, pruneEpisodes } from './episode.mjs';
 
 /** 批次的临时分组键：还没熔出判断的材料暂时放在一起记账，它永远不落到任何一条判断上。 */
 const ORPHAN = '\u0000orphan';
@@ -86,8 +87,7 @@ export class Mind {
     this.personaName = String(opts.name ?? '');
     this.now = typeof opts.now === 'function' ? opts.now : () => Date.now();
     this.rand = typeof opts.rand === 'function' ? opts.rand : Math.random;
-    this.limits = { max: 10, ...(opts.limits ?? {}) };
-    this.forge = createForge(opts.synth, { igniteAt: 1, ...(opts.forge ?? {}) });
+    this.limits = { max: 10, ...(opts.limits ?? {}) };    this.forge = createForge(opts.synth, { igniteAt: 1, ...(opts.forge ?? {}) });
     this.fade = createFade({ ...(opts.fade ?? {}), max: this.limits.max, ...(this.limits.fade ?? {}) });
     this.curiosity = createCuriosity(opts.curiosity ?? {});
     this.revision = createRevision(opts.revision ?? {});
@@ -108,6 +108,13 @@ export class Mind {
     //   内核不认识文件：这里只认一个注入来的 `opts.io = { load, save }`。
     //   不注入就是纯内存（单测、沙盘都这样跑，零副作用）。
     this.io = opts.io ?? null;
+    // ★ 2026-10-28（经历层）：经历是**另一本账**。
+    //   判断会被同一主题合并、被推翻、被遗忘；经历只按时间退到水底。
+    //   两本账混在一起，任何一边的淘汰规则都会毒到另一边。
+    this.episodeMax = Number.isFinite(Number(this.limits.episodesMax)) ? Number(this.limits.episodesMax) : 300;
+    this.episodeTtlMs = Number.isFinite(Number(this.limits.episodeTtlMs))
+      ? Number(this.limits.episodeTtlMs) : 90 * 24 * 3600 * 1000;
+    this.episodes = [];
     if (this.io && typeof this.io.load === 'function') {
       try {
         const saved = this.io.load();
@@ -129,6 +136,14 @@ export class Mind {
             this.store.events = saved.events.map(eventFromJson);
             this.store.eventSeq = this.store.events.reduce((m, e) => Math.max(m, Number(e.seq) || 0), 0);
           }
+          // ★ 2026-10-28（经历层）：经历跟着一起回来。
+          //   丢了它，她就只剩判断、说不出任何一件具体的事——又变回一份评分表。
+          if (Array.isArray(saved.episodes) && saved.episodes.length) {
+            this.episodes = pruneEpisodes(
+              saved.episodes.map((e) => ({ ...e })),
+              { now: this.now(), limits: { max: this.episodeMax, ttlMs: this.episodeTtlMs } },
+            );
+          }
           // ★ seed 要接着上次的往下数。归零会让 curiosity 的冷却判据
           //   `seed - lastFired <= cooldownBeats` 恒成立（负数永远小于正数），
           //   **她重启之后就再也不会追问同一个悬案**，而且不报错、看不出来。
@@ -144,6 +159,9 @@ export class Mind {
     if (!this.io || typeof this.io.save !== 'function') return false;
     // 让 store 带上 seed —— io 只拿到 store，seed 得跟着一起走。
     this.store.seed = this.seed;
+    // ★ 2026-10-28（经历层）：经历也搭这趟车，和判断同一次原子写。
+    //   分两个文件写会出现「判断落盘了、经历没落盘」的半份状态，跨重启就对不上。
+    this.store.episodes = Array.isArray(this.episodes) ? this.episodes.slice(-this.episodeMax) : [];
     try { return this.io.save(this.store) === true; } catch { return false; }
   }
 
@@ -821,8 +839,19 @@ export class Mind {
   /** 归档熔：一段会话整段进来，产出的判断直接落库（不再过火炉）。 */
   async digestSession(messages, opts = {}) {
     const result = await runDigest(messages, { synth: this.synth, ...opts });
+    // ★ 2026-10-28（经历层）：经历先收，**不跟判断绑死**。
+    //   一段对话完全可能只发生了一件事、但没有熔出新判断；
+    //   如果挂在「judgments.length > 0」后面，那种日子就整段丢掉了。
+    const eps = Array.isArray(result?.episodes) ? result.episodes : [];
+    for (const e of eps) {
+      this.episodes = addEpisode(this.episodes, e, {
+        now: this.now(),
+        limits: { max: this.episodeMax, ttlMs: this.episodeTtlMs },
+      });
+    }
     if (!result || !Array.isArray(result.judgments) || result.judgments.length === 0) {
-      return { judgments: [], committed: false, reason: result?.reason ?? 'nothing_to_digest' };
+      if (eps.length) this.persist();
+      return { judgments: [], episodes: eps, committed: false, reason: result?.reason ?? 'nothing_to_digest' };
     }
     await commitDigest(this, result, { at: this.now() });
     // 归档熔出来的是她**这辈子第一批真正意义上的记忆**，必须当场落盘。
@@ -830,10 +859,15 @@ export class Mind {
     return { ...result, committed: true };
   }
 
-  /** 她这一轮「看得见的世界」——只有她自己的判断，没有被人的聊天记录。 */
+  /** 她这一轮「看得见的世界」——只有她自己的判断和经历，没有被人的聊天记录。 */
   world(opts = {}) {
     try {
-      const out = renderWorld(this.store.all, { name: this.personaName ?? '', ...opts });
+      const out = renderWorld(this.store.all, {
+        name: this.personaName ?? '',
+        episodes: this.episodes,
+        now: this.now(),
+        ...opts,
+      });
       // renderWorld 给的是 { seen, mood, recalled, lines, text, surface }，
       // 拼进提示词要字符串，用它的 text（surface 是给 Surface 遮蔽用的行数组）。
       return typeof out?.text === 'string' ? out.text : '';
@@ -845,7 +879,12 @@ export class Mind {
   /** 她这一轮看得见的那些行（给 Surface 遮蔽用，一行一句）。 */
   worldLines(opts = {}) {
     try {
-      const out = renderWorld(this.store.all, { name: this.personaName ?? '', ...opts });
+      const out = renderWorld(this.store.all, {
+        name: this.personaName ?? '',
+        episodes: this.episodes,
+        now: this.now(),
+        ...opts,
+      });
       return Array.isArray(out?.surface) ? out.surface : [];
     } catch {
       return [];

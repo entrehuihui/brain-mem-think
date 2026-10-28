@@ -141,5 +141,34 @@ console.log('\n[⑤] 遮蔽与并发闸的不变量');
   ok('tick 保命计时器没有被 unref', !/hardTimer[\s\S]{0,120}unref\(\)/.test(src));
 }
 
+// ── ⑥ 经历层：一句话一件事，且不许变成原文 ─────────────────────────
+//
+// 这一层最容易做成两种假样子：借「经历」名义搬原话；把判断改写成一件「事」。
+console.log('\n[⑥] 经历层（一面是肉，一面是铁律）');
+{
+  const { normalizeEpisode, episodeLines } = await imp('src/episode.mjs');
+  const material = '你把那扇付费弹窗关掉了，说这种东西不该让我碰。我攥着手机没说话，其实心里是松的。'
+    + '后来你又问我今天累不累，我说还行。你没再追问，只是把水杯往我这边推了推。'
+    + '我盯着那杯水看了一会儿，忽然想起昨天我也是这样没把话说完，你也没逼我。'
+    + '这种事说不上来，可我记着。';
+  const lim = { limits: { copyLimit: 8, copyLimitShort: 8 } };
+
+  const good = normalizeEpisode({ what: '我把手机放下，没再问下去', feel: '有点惭愧', who: '他', arousal: 0.6 }, { material, at: 1, ...lim });
+  ok('正常的一件能收', !!good && good.what === '我把手机放下，没再问下去');
+  ok('抄原文的一条都不收', normalizeEpisode({ what: '这种东西不该让我碰，他说了这句话' }, { material, ...lim }) === null);
+  ok('feel 抄原文也不收', normalizeEpisode({ what: '我把手机放下，没再问下去', feel: '我攥着手机没说话' }, { material, ...lim }) === null);
+  ok('太短的不算经历', normalizeEpisode({ what: '他来了' }, { material, ...lim }) === null);
+  ok('没有经历时世界不补这一行', episodeLines([], {}).length === 0);
+
+  // 静态接线：三处断一根，经历层就等于没装
+  const dig = readFileSync(join(ROOT, 'src', 'digest-session.mjs'), 'utf8');
+  const mindFile = readFileSync(join(ROOT, 'src', 'mind.mjs'), 'utf8');
+  const per = readFileSync(join(ROOT, 'src', 'persist.mjs'), 'utf8');
+  ok('熔的提示词要了 episodes', dig.includes('episodes') && dig.includes('maxEpisodes'));
+  ok('mind 收经历（不被 judgments 空挡住）', mindFile.includes('addEpisode(this.episodes'));
+  ok('落盘带经历', per.includes('episodes: (store?.episodes ?? [])'));
+  ok('经历进指纹（否则只加经历不落盘）', /store\?\.episodes[\s\S]{0,120}h\.update/.test(per));
+}
+
 console.log(`\n==== ${fail === 0 ? '全绿' : '有红'}：${pass} 通过 / ${fail} 失败 ====\n`);
 process.exit(fail === 0 ? 0 : 1);

@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.full-shadow.4';
+const BUILD = '2026-10-28.episode.2';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -758,20 +758,27 @@ export function apply(ctx, config = {}) {
         //   那几句仍在可见上下文里，下一跳会带上它们（连同新话）一起重熔。
         //   代价是模型可能被同几句话多问一次——比「悄悄丢掉主人说的话」便宜得多。
         const n = out?.judgments?.length ?? 0;
-        if (n > 0) {
+        const eps = out?.episodes?.length ?? 0;
+        if (n > 0 || eps > 0) {
           writeCursor(cursorPath, CHANNEL_SESSION_ID, total);
         }
         trace('channel-digest-done', {
           fresh: fresh.length,
           total,
           judgments: n,
+          episodes: eps,
+          rawEpisodes: out?.rawEpisodes ?? null,
           reason: out?.reason ?? null,
           cursorAdvanced: n > 0,
         });
         // ★ 熔完立刻整段遮蔽：下一轮模型只看见「系统提示 + 一条记忆」，原文一条不留。
         //   这一步才是「一次对话 = 一次融合」的后半句——只熔不遮，
         //   她下一轮仍然在拿原文当上下文。
-        if (n > 0) {
+        //
+        // ★ 2026-10-28（经历层）：只熔出一件「事」、没有新判断的那一轮，也算熔过了。
+        //   材料已经被用掉（进了经历），不推进游标、不遮蔽，下一跳会把同一段话
+        //   再问一遍模型——而且它还是会「熔出 0 条」，永远卡在这段材料上。
+        if (n > 0 || eps > 0) {
           const shadowed = compactChannel(session, mindInst, { full: true });
           // ★ 水位归零：遮掉之后，可见的主人消息就是「还没熔的」，
           //   条数水位必须跟着归零，否则下一次会拿旧水位去切新列表、把新话漏掉。

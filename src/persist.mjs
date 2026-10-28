@@ -93,6 +93,10 @@ export function fingerPrint(store) {
   // ★ 2026-10-28（阶段 C）：观测流也要进指纹。
   //   不然「只有新观测、没有新判断」的那种变化永远不落盘，归纳就少数据。
   for (const e of store?.events ?? []) h.update(`${e.seq}|${e.at}|${e.actor}|${e.action}|${e.polarity}\n`);
+  // ★ 2026-10-28（经历层）：经历也进指纹。
+  //   踩过的坑就在上一行写着——「只改新加的字段，指纹不变，save 直接跳过」。
+  //   经历往往一天只涨一条、判断一条没变，漏了它就成了「明明写了，重启就没了」。
+  for (const e of store?.episodes ?? []) h.update(`${e.id}|${e.at}|${e.what}|${e.arousal}\n`);
   return h.digest('hex').slice(0, 16);
 }
 
@@ -129,6 +133,8 @@ export function createFileIo(path) {
         seed: Number(obj.seed ?? 0),
         // ★ 2026-10-28（阶段 C）：观测流
         events: Array.isArray(obj.events) ? obj.events : [],
+        // ★ 2026-10-28（经历层）：经历和判断同一次原子写，一起回。
+        episodes: Array.isArray(obj.episodes) ? obj.episodes : [],
       };
     },
 
@@ -156,6 +162,12 @@ export function createFileIo(path) {
           events: (store?.events ?? []).map((e) => ({
             seq: e.seq, at: e.at, actor: e.actor, action: e.action, polarity: e.polarity,
             text: e.text, themeKey: e.themeKey, source: e.source, weight: e.weight, beliefId: e.beliefId,
+          })),
+          // ★ 2026-10-28（经历层）：经历原样存，只存她自己的话。
+          //   KEEP 那套字段白名单是给 Belief 的；经历结构不同，单独写。
+          episodes: (store?.episodes ?? []).map((e) => ({
+            id: e.id, at: e.at, who: e.who, what: e.what, feel: e.feel,
+            arousal: e.arousal, themeKey: e.themeKey, source: e.source, counts: e.counts,
           })),
         };
         const text = JSON.stringify(body, null, 1);

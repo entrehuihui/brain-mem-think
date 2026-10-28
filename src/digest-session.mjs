@@ -18,12 +18,16 @@ import { Belief, PREDICATES, STATUS, clean, normalizeRelation, recordTurn, setTe
 import { canonicalRelation, longestSharedRun, COPY_RUN_LIMIT, looksClinical, mainPathHolds, stabilityOf } from './forge.mjs';
 import { strengthOfBelief } from './strength.mjs';
 import { makeEvent } from './event.mjs';
+import { normalizeEpisode } from './episode.mjs';
 
 export const DIGEST_DEFAULTS = Object.freeze({
   maxCharsPerMessage: 600,
   maxMessages: 200,
   minMaterialChars: 24,
   maxVerdicts: 4,
+  // ★ 2026-10-28（经历层）：一次熔最多记几件事。三条是「这段时间发生过什么」的粒度；
+  //   再多就变成流水账，而流水账正是这个插件从第一天就要甩掉的东西。
+  maxEpisodes: 3,
 });
 
 /** 把一段会话拼成材料。只用一次，不存。 */
@@ -94,13 +98,31 @@ export function buildDigestPrompt(material, prior = []) {
     '   从里面看的是：他想要什么、你愿意给什么、你心里是紧还是松、你怕失去什么。',
     '   这类材料**不要**提炼做事的方法，也不要总结流程和标准。',
     '',
+    // ★ 2026-10-28（经历层）：判断是「我看出了什么」，经历是「当时发生了什么」。
+    //   只要判断，她就只记得「我很急」，说不出是哪一次急、你当场什么反应。
+    //   这一条要的就是那一件事，但必须是她自己的话，不是原话的搬运。
+    //
+    // ★ 2026-10-28 第二次（真实熔了一次 judgments:2 / episodes:0）：
+    //   第一版把它写成「第 7 条」，模型直接无视了——它连 episodes 字段都没给。
+    //   现在改成 judgments 之后、JSON 之前的**强制交付项**，并给了正例；
+    //   同时明确「判断可以是 0 条，经历只要真发生过事就必须给」——
+    //   否则模型会用「不值得记」把这一层整个跳过。
+    '另外，必须交出 `episodes`：这段时间里**实际发生过的 1~3 件事**。',
+    '   · 判断是「我看出了什么」，经历是「当时到底怎么了」——两样都要，不许只给判断。',
+    '   · what ≤48 字，写你当时的样子/你做了什么；feel ≤24 字，写当时心里那句话；',
+    '     who 一个词；arousal 是 0~1 的数字。',
+    '   · 不许抄材料原话（撞上就被整条丢掉）——写你手上的动作、心里的动静，别搬句子。',
+    '   · 判断可以是 0 条；只要这段时间真发生过事，经历就至少给一条。真的什么都没发生才给 []。',
+    '   · 例：{"what":"我把手机扣在桌上，没再问那扇窗的事","feel":"松了一下，又有点惭愧","who":"他","arousal":0.7}',
+    '',
     '必须交出：relation（谓词，从这个表里挑：' + Object.keys(PREDICATES).join(' ') + '）、',
     'subject（关于谁，一个词）、polarity（favorable 或 unfavorable）、weight（0~1）。',
     '',
     '只输出 JSON：',
     '{"judgments":[{"text":"那句话","why":"为什么","relation":"stalls","subject":"他","polarity":"unfavorable","weight":0.6}],',
+    ' "episodes":[{"what":"我攥着他那句半截话，没敢问下去","feel":"怕问出来就散了","who":"他","arousal":0.7}],',
     ' "theme":"这一整段说的是哪一摊事（可空）"}',
-    '或者 {"judgments":[]}。',
+    '或者 {"judgments":[],"episodes":[]}。',
   ].join('\n');
 }
 
@@ -209,9 +231,24 @@ export async function digestSession(messages, ctx = {}) {
     if (out.some((x) => similarity(x.text, one.text) >= 0.86)) continue;
     out.push({ ...one, themeHint: clean(raw.theme ?? '', 40) || null });
   }
+  // ★ 2026-10-28（经历层）：同一次熔还要交出「发生了什么事」。
+  //   和判断一起熔、一起过抄原文的闸，但落到另一个账本（episodes 不是判断）。
+  //   模型没给 / 全被闸拦掉都不影响判断入库 —— 这一层是加法，不是前置条件。
+  const episodes = [];
+  for (const e of (Array.isArray(raw.episodes) ? raw.episodes : []).slice(0, opts.maxEpisodes ?? 3)) {
+    const one = normalizeEpisode(e, { material, at: ctx.now, limits: opts.episodeLimits });
+    if (!one) continue;
+    if (episodes.some((x) => similarity(x.what, one.what) >= 0.86)) continue;
+    episodes.push(one);
+  }
   return {
     committed: true,
     judgments: out,
+    episodes,
+    // ★ 诊断用：模型**原始**交了几条经历（-1 = 它压根没给这个字段）。
+    //   真实熔出 0 条时，要能一眼分清「模型没给」和「给了但被抄原文的闸拦了」——
+    //   这两种病的药完全不同。
+    rawEpisodes: Array.isArray(raw.episodes) ? raw.episodes.length : -1,
     reason: out.length ? 'digested' : 'nothing_usable',
     materialChars: material.length,
   };

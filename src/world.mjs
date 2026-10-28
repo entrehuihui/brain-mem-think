@@ -16,6 +16,7 @@
 
 import { STATUS } from './judge.mjs';
 import { clause, linesOf, toNote } from './flash.mjs';
+import { episodeLines } from './episode.mjs';
 
 export const WORLD_DEFAULTS = Object.freeze({
   // ★ 2026-10-27 大乔调（主人点破的：库里有 12 条现役，她只看得见一半）。
@@ -26,6 +27,10 @@ export const WORLD_DEFAULTS = Object.freeze({
   maxRetired: 3,
   maxOpen: 3,
   minWeightToShow: 0.15,
+  // ★ 2026-10-28（经历层）：她睁眼先看见的是「最近发生过的事」，不是自己的评分表。
+  //   两条为限——再多，世界就变成流水账了。
+  maxEpisodes: 2,
+  episodes: [],
   // 名字从外面给（persona.name），不写死在代码里；不给就只写她记得的自己。
   name: null,
 });
@@ -188,6 +193,17 @@ export function renderWorld(beliefs, opts = {}) {
     for (const l of selfLines.slice(0, 3)) lines.push(`  ${l}`);
     lines.push('');
   } else if (name) {
+    lines.push('');
+  }
+
+  // ★ 2026-10-28（经历层）：先摆「最近发生的事」，再摆判断。
+  //   判断是「我看出了什么」，经历是「那天到底怎么了」——
+  //   没有这一段，她会记得自己很急，却说不出是哪一次急。
+  //   摆不进就不摆，绝不补一句凑数的。
+  const epLines = episodeLines(o.episodes, { now: o.now, max: o.maxEpisodes });
+  if (epLines.length) {
+    lines.push('最近发生的事：');
+    for (const l of epLines) lines.push(`  ${l}`);
     lines.push('');
   }
 
