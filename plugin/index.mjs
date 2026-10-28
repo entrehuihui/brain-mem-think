@@ -916,7 +916,30 @@ export function apply(ctx, config = {}) {
       lastChannelDigestAt = now;
       trace('channel-digest-start', { fresh: fresh.length, total, reset });
       try {
+        // ★ 2026-10-28 18:30（熔完必落盘 · 线上取证）
+        //
+        //   09:52–10:04 线上那十次，日志是这样的：
+        //     channel-digest-start → channel-digest-done{reason:nothing_to_digest}
+        //   **中间一次 synth-reply 都没有**——模型压根没被问到。
+        //   同一时段她「要不要开口」那一问又正常回了 180/192 字。
+        //   也就是说：「10 批主人原话熔不出一个字」这句话，之前是**猜的**，
+        //   真相是**根本没熔**。
+        //
+        //   所以这一圈必须留字：材料进了多少、模型原话多长、扔到哪个 reason。
+        //   不留这两行，next 一轮还会有人（包括我）对着一个空结论编原因。
+        const materialChars = fresh.reduce((n, x) => n + String(x?.text ?? '').length, 0);
+        trace('channel-digest-material', { fresh: fresh.length, chars: materialChars });
+        if (!mindInst?.synth) {
+          trace('channel-digest-skip', { why: 'no-synth', hasMind: !!mindInst });
+          return;
+        }
         const out = await mindInst.digestSession(fresh);
+        trace('channel-digest-result', {
+          judgments: out?.judgments?.length ?? 0,
+          episodes: out?.episodes?.length ?? 0,
+          reason: out?.reason ?? null,
+          committed: !!out?.committed,
+        });
         // ★ 2026-10-27 大乔修（漏熔）：**空熔不推进游标**。
         //
         //   原来这里无条件 writeCursor(total)——只要模型回了个空（too_little /
