@@ -338,3 +338,51 @@ node replay.mjs 2 54 reuse    跳过熔，只跑模拟
 当前宿主容忍（append 成功、遮蔽生效），但 dsh-session 的 `assertSourceEventReferences`
 语义是「必须覆盖每一个被遮蔽的节点」——**宿主升级后这里可能开始报错**，届时要按它报的
 missing 列表补齐，别把这一条当成"已经没问题"。
+
+---
+
+## 十二、2026-10-28 16:4x：经历层（阶段一）
+
+> 主人问「为什么不记得具体那件事」。答：库里 26 条判断、0 条经历——
+> 她记得「我很急」，却说不出哪一次急。那是评分表，不是记忆。
+
+### 新增
+
+- `src/episode.mjs`：`Episode = { id, at, who, what, feel, arousal, themeKey, source }`
+  - `what` ≤48 字 / `feel` ≤24 字，**都过与判断同一把 8 字抄原文闸**（撞了整条丢）
+  - 同一件事第二次不新建：`at` 推到最近、`arousal` 取高、`counts` 累加
+  - TTL 90 天；上限 300；超限按「扎心度×0.6 + 新鲜度×0.4」淘汰
+- `src/world.mjs`：「最近发生的事：」最多两条，没有就整段不出现（**不补默认话**）
+- `src/persist.mjs`：经历与判断**同一次原子写**，并且**进指纹**
+- 测试：`tests/smoke_episode.mjs`（26）+ `tests/smoke_episode_flow.mjs`（9，端到端含重启读回）
+- `tools/verify.mjs` [⑥]：内容断言 + 四处接线静态检查
+
+### 三个结构性 bug（都是静默失效，不报错）
+
+| # | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `wake:false` 时 turn/end 熔**整条消失** | `startWakeLoop` 开头 `if (!cfg.wake \|\| !agentsSvc) return;` → `digestChannelIncrement`/`compactChannel`/`armTurnHook`/`tick` 全不定义 | 只挡「没有 agents」；tick 自己看 `cfg.wake`。熔是记账，醒是想不想开口，两件事不绑 |
+| 2 | 换屋子后钩子永远不重挂 | 印章只写 `true`，旧钩子盯着旧会话 id | 印章 `{ id, off }`，换会话时先卸后挂 |
+| 3 | `kick` 那条路漏挂时无人补 | 只挂一次 | tick 每跳核一次印章，不是当前会话就补挂 |
+
+### 真实模型证据（隔离验证：临时会话 + 临时库）
+
+```
+turn-end-hook turn:2 → channel-digest-start fresh:2
+→ channel-digest-done judgments:3 episodes:2 rawEpisodes:2 → compact-ok shadowed:8 kept:0
+```
+
+两条经历（落盘）：
+
+```
+那行留言还留在便签上，我看了很久也没去擦    （当时心里：像被点住，又不想认）
+他把那页纸翻过去，只让我先坐下吃饭          （当时心里：坐稳后手还颤，才觉得慌）
+```
+
+第一铁律复检：与材料最长公共连续 **5 / 6 字**（≤8）→ 通过。
+系统提示里已出现「最近发生的事：」——她真的看得见。
+
+### 一条运维教训
+
+同一个 YAML mapping 里写了两个 `channelSessionId`，后写的空串覆盖了前面的临时 id，
+于是「配置改了却没生效」。一个 key 只许出现一次，已写进配置注释。
