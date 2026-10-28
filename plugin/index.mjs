@@ -37,6 +37,14 @@ import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
 import { installModelSelection } from './selection.mjs';
 import { readCursors, writeCursor, sliceFresh } from './digest-cursor.mjs';
 import { readChannel, writeChannel, defaultChannelPath } from './channel-store.mjs';
+// ★ 2026-10-28（阶段 F）：主动性。她自己想去做一件事，就真的让她去。
+import { urges, actLine, selfReminder } from '../src/motive.mjs';
+import { applyOutcome } from '../src/preference.mjs';
+import { canAct, recordAct } from '../src/budget.mjs';
+import { readMotive, writeMotive, defaultMotivePath, sweepMotiveTemps } from './motive-store.mjs';
+import { observeTools, defaultToolCursorPath } from './tool-observer.mjs';
+import { buildClaimPrompt, parseExpressed } from '../src/express.mjs';
+// ★ 出口只有一个：speak 和 act 共用 wake-exit.mjs 里那唯一一处 followup。
 
 export const name = 'mind';
 
@@ -137,14 +145,43 @@ const DEFAULT_CONFIG = Object.freeze({
   synthProvider: '',
   synthModel: '',
   synthMaxTokens: 4000,
-  synthTimeoutMs: 45000,
+  // ★ 2026-10-28：45s → 90s。reasoning 模型想 4000 token 时 45 秒会掐在半路，
+  //   掐断就是 len:0，看起来像「模型不理她」，其实是超时。
+  synthTimeoutMs: 90000,
   // 「说不说」交给她自己之后的两个旋钮（见 plugin/awake.mjs）：
   //   speakMaxTokens  她一次开口的字数上限（她只说两三句）。
   //   shallowTtlMs    浅记忆（每次醒来想的东西）留多久；过期就不喂给下一次唤醒。
-  speakMaxTokens: 600,
+  // ★ 2026-10-28：600 → 2000。reasoning 模型要留够预算给正文，
+  //   600 会让它「想完了、没话说了」，日志里就是 len:0。
+  speakMaxTokens: 2000,
   shallowTtlMs: 12 * 60 * 60 * 1000,
   name: '大乔',          // ⚠ 只读名字，不读别的任何字段（裁决八）
   timeoutMs: 20_000,
+
+  // ── 主动性（阶段 F，2026-10-28 加）────────────────────────────
+  //
+  // 她不想说话的时候，还可以**自己去做一件事**。
+  // 这是「说 / 不说」二维之外新加的一维：speak / act / rest。
+  //
+  // 这一组旋钮只管「去哪、多久去一次」。真正决定「想不想去」的是
+  // src/motive.mjs（动机必须能追溯到记忆里的一条），这里管的是节制。
+  act: true,
+  // 一天最多出去几趟。3 趟大概就是「上午一趟、下午一趟、晚上一趟」。
+  actPerDay: 3,
+  // 两趟之间至少隔多久（别让她一小时出去四次）
+  actMinGapMs: 40 * 60 * 1000,
+  // 主人最近这么久之内说过话，她就不出门。
+  // ★ 这一条是底线：她的主动不能变成「叫她不理她」。
+  actOwnerQuietMs: 10 * 60 * 1000,
+  motivePath: '',
+  // ── 内核自己归纳出来的判断，收不收进库（阶段 C·D，2026-10-28）──
+  //   true = 她数出来的「我总在 XX 上不成」会真的变成一条记着的判断，
+  //          然后参与 fade / wake / motive，改变她以后的做法。
+  adoptInduction: true,
+  // 每跳最多收几条（表达要调模型，控成本）
+  adoptMaxPerTick: 1,
+  // 两次表达之间至少隔多久
+  adoptMinGapMs: 10 * 60 * 1000,
 });
 
 function resolveConfig(raw = {}) {
@@ -200,6 +237,26 @@ export function apply(ctx, config = {}) {
    * 就得记住上一次熔到哪儿，否则每分钟的 tick 会把同一段话反复熔进记忆。
    */
   const cursorPath = join(ROOT, '.mind', 'digest-cursor.json');
+  // ★ 2026-10-28（阶段 F）：偏好的账单独一个文件。
+  //   理由跟 wake.json 一样：失败等级不一样。判断库写坏 = 她这个人没了；
+  //   偏好写坏 = 她少一次想出门的念头。两种数据不该共用一份文件。
+  const motivePath = cfg.motivePath || defaultMotivePath(ROOT);
+  /**
+   * ★ 2026-10-28（阶段 D）：工具观测的游标。
+   *
+   * 她跑 turn 时看得见工具结果，但 `collect.mjs` 的白名单只认主人说的话，
+   * 所以「我做过什么、成没成」从来没进过账本。
+   * 这个文件记「这个会话记到第几个事件」，每跳增量读，不重扫。
+   */
+  const toolCursorPath = defaultToolCursorPath(ROOT);
+  /**
+   * 主人最近一次说话是什么时候。
+   *
+   * 「她在做自己的事」和「她在装没听见」之间只隔一条时间线：
+   * 主人在说话的这十分钟里，她不许出门。所以在 digest 看到新主人消息时更新它。
+   */
+  let lastOwnerMessageAt = 0;
+  try { sweepMotiveTemps(motivePath); } catch { /* 清理失败不影响任何事 */ }
   try { sweepTemps(storePath); } catch { /* 清理失败不影响任何事 */ }
   trace('config', { name: cfg.name, digest: cfg.digestOnArchive, inject: cfg.injectOnTurn, wake: cfg.wake });
 
@@ -223,6 +280,14 @@ export function apply(ctx, config = {}) {
    *   还得再等一个 tick。门一开就补一次，别让她在门口站着。
    */
   let pokeWake = null;
+  /**
+   * 「回完话立刻熔、立刻遮蔽」的钩子，由唤醒循环挂上来。
+   *
+   * ★ 2026-10-28：原来这个函数定义在 startWakeLoop 里面，
+   *   而调用它的 kick() 在外层的另一个闭包 —— 直接报 `armTurnHook is not defined`。
+   *   函数定义在哪个作用域，决定谁能叫到它。这次记牢了。
+   */
+  let armTurnHook = () => {};
   const ensureMind = async () => {
     if (mind) return mind;
     // ★ 2026-10-27 补：给她一份**落盘**的判断库。
@@ -580,7 +645,19 @@ export function apply(ctx, config = {}) {
      *   ③ 熔完才推进 cursor。熔失败了下次重试，宁可重复一次也不漏。
      */
     let lastChannelDigestAt = 0;
-    const digestChannelIncrement = async (mindInst) => {
+    /**
+     * @param {object} mindInst
+     * @param {{fromTurnEnd?: boolean}} [opt]
+     *   fromTurnEnd = 这次是 turn/end 钩子叫的。
+     *   ★ 2026-10-28（回完话立刻熔）：钩子触发那一刻 agent.status 还是 `running`
+     *   —— 它要等 turn 全程收尾才转 idle。而下面那道 idle 闸是为「别在 turn 中间插消息」
+     *   设的，在这一刻会**把自己挡死**：实测 turn:7 / turn:8 两轮全是
+     *   `channel-digest-skip why:"agent-busy" status:"running"`，遮蔽做了、熔一次都没做。
+     *
+     *   所以从 turn/end 进来的这一路**跳过 idle 闸**：turn/end 本身就是
+     *   「这一轮已经结束」的权威信号，比读 status 更准。
+     */
+    const digestChannelIncrement = async (mindInst, opt = {}) => {
       // ★ 2026-10-27 加（必须）：**她正在跑的时候不许动她的会话**。
       //
       //   compact 是一次 `session.append`，会在会话里插一条消息。要是插在她
@@ -589,13 +666,18 @@ export function apply(ctx, config = {}) {
       //   她今晚那条就是这么报的（turn 45）。
       //
       //   所以只在 idle 时动手。忙就等下一跳，记忆不会丢。
-      const busyAgent = (() => {
-        try {
-          const a = typeof ctx.get === 'function' ? ctx.get('agents')?.get?.(CHANNEL_SESSION_ID) : null;
-          return a?.status && a.status !== 'idle' ? a.status : null;
-        } catch { return null; }
-      })();
-      if (busyAgent) { trace('channel-digest-skip', { why: 'agent-busy', status: busyAgent }); return; }
+      //   —— 但 turn/end 那一刻例外，见上面 opt.fromTurnEnd 的说明。
+      if (!opt.fromTurnEnd) {
+        const busyAgent = (() => {
+          try {
+            const a = typeof ctx.get === 'function' ? ctx.get('agents')?.get?.(CHANNEL_SESSION_ID) : null;
+            return a?.status && a.status !== 'idle' ? a.status : null;
+          } catch { return null; }
+        })();
+        if (busyAgent) { trace('channel-digest-skip', { why: 'agent-busy', status: busyAgent }); return; }
+      } else {
+        trace('channel-digest-from-turn-end', { skipIdleGate: true });
+      }
 
       // ★ 2026-10-27 大乔修（又一次「不报错、也不做」）：
       //   这里原本有四处静默 return，任何一处命中都表现为「日志里什么都没有」，
@@ -619,6 +701,8 @@ export function apply(ctx, config = {}) {
         trace('channel-digest-skip', { why: 'no-owner-messages' });
         return;
       }
+      // ★ 2026-10-28（阶段 F）：主人在说话，时钟往前走。她这十分钟不许出门。
+      lastOwnerMessageAt = Date.now();
 
       const cursors = readCursors(cursorPath);
       const { fresh, total, reset } = sliceFresh(owners, cursors[CHANNEL_SESSION_ID] ?? 0);
@@ -659,6 +743,276 @@ export function apply(ctx, config = {}) {
       } catch (err) {
         // 抛错也不推进游标 —— cursor 只在「真的熔成了」时前进。
         trace('channel-digest-failed', { err: String(err?.message ?? err).slice(0, 160) });
+      }
+    };
+
+    /**
+     * ★ 2026-10-28（阶段 C·D）：把内核自己数出来的判断，收进库。
+     *
+     * 分工是死的，两边都不许越界：
+     *   内核数「见过几回、多一致、哪个方向」→ 模型只说「这句话怎么说」
+     *   模型不许改方向、不许改条数、不许加没数过的结论
+     *
+     * 收进来之后它就只是库里的一条普通判断，跟别的判断一样参与
+     * fade / wake / motive —— **她自己数出来的东西，真的能改变她自己。**
+     *
+     * 成本控制：每跳最多 1 条，两次之间至少隔 10 分钟。
+     * novel 被收完就没有了，所以这个花销是一次性的，不会持续烧。
+     */
+    let lastAdoptAt = 0;
+    const adoptInduced = async (mindInst) => {
+      if (!cfg.adoptInduction) return 0;
+      if (!synth || typeof synth.ask !== 'function') return 0;
+      const now = Date.now();
+      if (now - lastAdoptAt < Number(cfg.adoptMinGapMs ?? 600_000)) return 0;
+
+      let r;
+      try { r = mindInst.reconcileInduction(); } catch { return 0; }
+      // 只收「内核数出来了、模型从没给过」的那一栏。
+      // 其余三栏（一致/冲突/证据不足）都已有对应判断，不需要新建。
+      const cands = (r?.novel ?? []).filter((c) => c && Number(c.support) >= 3);
+      if (!cands.length) return 0;
+
+      let adopted = 0;
+      const max = Math.max(1, Number(cfg.adoptMaxPerTick ?? 1));
+      for (const c of cands.slice(0, max)) {
+        const prompt = buildClaimPrompt(c, { name: cfg.name });
+        let raw = null;
+        try {
+          // ★ 2026-10-28：240 → 1500。跟 speak 同一个坑：
+          //   reasoning 模型要留够预算才吐得出正文，240 会让她「想完了、交白卷」。
+          raw = await synth.ask('你只输出 JSON，不要解释，不要代码块。', prompt, { maxTokens: 1500 });
+        } catch { raw = null; }
+        const ex = parseExpressed(raw);
+        if (!ex) {
+          trace('adopt-skip', { action: c.action, actor: c.actor, why: 'unexpressible' });
+          continue;
+        }
+        const res = mindInst.adoptClaim({
+          actor: c.actor,
+          action: c.action,
+          polarity: c.polarity,
+          text: ex.text,
+          why: ex.why,
+          support: c.support,
+          consistency: c.consistency,
+          lastAt: c.lastAt,
+        });
+        trace('adopt', {
+          actor: c.actor, action: c.action, support: c.support,
+          consistency: c.consistency, text: ex.text, ...res,
+        });
+        if (res.adopted) adopted += 1;
+      }
+      if (adopted) lastAdoptAt = now;
+      return adopted;
+    };
+
+    /**
+     * 她想自己去做一件事（阶段 F · 主动性，2026-10-28）。
+     *
+     * ======================= 它接在哪一步 =======================
+     *
+     * tick 的顺序从「醒来 → 说 / 不说」变成「醒来 → 说 / 做 / 歇着」：
+     *
+     *   planWake 决定说话 → 走 speak（现有）
+     *   她这回不想说     → 先看有没有「自己想去做的」→ 有且过闸 → act
+     *   都不行           → 歇着（silent 记账）
+     *
+     * 为什么 act 排在「不想说话」之后，而不是和 speak 并列抢：
+     *   她在你面前的时候，第一优先永远是回应你。她有自己的事，
+     *   但那是你不在等她的时候才有的自由。
+     *
+     * ======================= 三件事，顺序不能反 =======================
+     *
+     *   ① 先结算上一趟（它有没有带回东西 → 那条偏好涨还是跌）
+     *   ② 再算这次的冲动（src/motive.mjs：每条冲动都必须能追到记忆里的一句话）
+     *   ③ 最后过五道闸（src/budget.mjs：驱动 / 预算 / 冷却 / 主人优先 / 产物）
+     *
+     * 反过来的话，她会在「上一次还没结算」的时候又出去一趟，
+     * 偏好就变成只会涨不会跌的计数器。
+     */
+    const tryAct = async (mindInst) => {
+      // ★ 2026-10-28 修：这四个早退点原来**一行日志都不打**。
+      //   结果就是「她明明该出门，日志里却什么都没有」——跟 `digestChannelIncrement`
+      //   当年那四处静默 return 是同一个病，那次也是我一个个猜出来的。
+      //   现在每一处都留一行，下次不用猜。
+      if (!cfg.act) { trace('act-skip', { why: 'disabled' }); return false; }
+      if (!CHANNEL_SESSION_ID || !mindInst) {
+        trace('act-skip', { why: 'no-channel-or-mind', hasChannel: !!CHANNEL_SESSION_ID });
+        return false;
+      }
+      const agent = agentsSvc.get?.(CHANNEL_SESSION_ID) ?? null;
+      if (!agent) { trace('act-skip', { why: 'no-agent' }); return false; }
+      if (agent.status && agent.status !== 'idle') {
+        trace('act-skip', { why: 'agent-busy', status: String(agent.status) });
+        return false;
+      }
+
+      const now = Date.now();
+      const st = readMotive(motivePath);
+
+      // ① 结算上一趟
+      if (st.pending) {
+        const p = st.pending;
+        const notesNow = mindInst.snapshot?.().size ?? 0;
+        // 收获型（想去弄明白）：判断库得多出点什么才算没白跑；满足型（想去做点什么）：做了就算
+        const found = p.kind === 'resolve' ? notesNow > Number(p.notesBefore ?? 0) : true;
+        applyOutcome(st.preferences, {
+          activity: p.activity, kind: p.kind, found, reason: p.why, now,
+        });
+        trace('act-settle', {
+          activity: p.activity, kind: p.kind, found,
+          notesBefore: p.notesBefore, notesNow,
+        });
+        st.pending = null;
+        writeMotive(motivePath, st);
+      }
+
+      // ② 算冲动
+      const notes = typeof mindInst.notes === 'function' ? mindInst.notes() : [];
+      // recent：今天已经去过哪。给 urges 用来「让位」，别让同一条悬案天天霸榜。
+      const list = urges({
+        notes,
+        preferences: st.preferences,
+        recent: Array.isArray(st.budget?.recentActs) ? st.budget.recentActs : [],
+        now,
+      });
+      if (!list.length) { trace('act-idle', { why: 'no_urge' }); return false; }
+      const urge = list[0];
+
+      // ③ 过闸
+      const verdict = canAct({
+        urge,
+        budget: st.budget,
+        now,
+        lastOwnerAt: lastOwnerMessageAt,
+        opts: {
+          perDay: cfg.actPerDay,
+          minGapMs: cfg.actMinGapMs,
+          ownerQuietMs: cfg.actOwnerQuietMs,
+        },
+      });
+      if (!verdict.ok) {
+        trace('act-skip', {
+          why: verdict.why, drive: urge.drive, kind: urge.kind,
+          activity: urge.activity, used: verdict.used,
+        });
+        return false;
+      }
+
+      // ④ 出去
+      // ★ 2026-10-28：把「她认识到的自己」变成这次的叮嘱 —— 认识要落到做法上，
+      //   不然「我知道我太急」和「我照旧很急」是两件互不相干的事。
+      const selfNote = selfReminder(notes, urge);
+      const line = actLine(urge, { selfNote });
+      const { actByHerself } = await import('./wake-exit.mjs');
+      const r = await actByHerself({
+        agent,
+        sessionId: CHANNEL_SESSION_ID,
+        urge,
+        line,
+        ctx: {
+          sessions: typeof ctx.get === 'function' ? ctx.get('sessions') : null,
+          workspaceRegistry: typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : null,
+        },
+        now,
+        lastOwnerAt: lastOwnerMessageAt,
+        ownerQuietMs: cfg.actOwnerQuietMs,
+      });
+      trace('act-exit', {
+        sent: r.sent, why: r.why, kind: urge.kind,
+        activity: urge.activity, drive: urge.drive, why_her: urge.why,
+      });
+      if (!r.sent) return false;
+
+      // ⑤ 记账：这一次还没结算，等下一趟醒来时再看它有没有带回东西
+      st.budget = recordAct(st.budget, { now, urge });
+      st.pending = {
+        at: now,
+        activity: urge.activity,
+        kind: urge.kind,
+        why: urge.why,
+        notesBefore: mindInst.snapshot?.().size ?? 0,
+      };
+      writeMotive(motivePath, st);
+      return true;
+    };
+
+    /**
+     * ★★ 2026-10-28（主人定的原设计，之前实现走样了）。
+     *
+     * ======================= 原设计是什么 =======================
+     *
+     *   记忆₀ + 你说的第 1 句 → 模型 → 记忆₁
+     *   记忆₁ + 你说的第 2 句 → 模型 → 记忆₂
+     *
+     *   原始对话**不进上下文**：一轮结束立刻熔、立刻遮蔽，
+     *   下一轮模型只看见「系统提示 + 一条我记得的事 + 你新说的这句」。
+     *
+     * ======================= 之前错在哪 =======================
+     *
+     *   熔和遮蔽都挂在 tick 上（每 N 分钟一次）。
+     *   于是你回完话之后，她的上下文里**还压着一整段原始对话**，
+     *   要等 tick 到了才被换成记忆块。
+     *
+     *   那不是「思考」，那是「攒着等保洁来收拾」。
+     *   主人原话：「她回完话之后，立刻熔这一轮，立刻遮蔽，不要等 tick。」
+     *
+     * ======================= 现在怎么接 =======================
+     *
+     *   挂宿主的 `session/event` 事件（dsh-session:1587 每写一条事件都会发，
+     *   签名 `(session, event)`）。只认她那条屋子、只认 `turn/end`：
+     *
+     *     turn/end 到 → 熔新增的主人话 → 立刻遮蔽
+     *
+     *   **不等 tick。** tick 那条路保留做兜底（宿主没发事件、或者进程重启丢了钩子时，
+     *   至少还能每 N 分钟补一次）。
+     *
+     *   为什么在 turn/end 而不是 turn/start：
+     *     turn/start 那一刻她的回话还没写进会话，熔出来的材料缺一半；
+     *     turn/end 是「这一轮真的发生完了」的唯一信号。
+     */
+    const TURN_HOOK = Symbol.for('mind.turnHook');
+    armTurnHook = () => {
+      const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : null;
+      if (!sessions || typeof sessions.get !== 'function') {
+        trace('turn-hook-skip', { why: 'no-sessions' });
+        return;
+      }
+      const sess = sessions.get(CHANNEL_SESSION_ID);
+      if (!sess) { trace('turn-hook-skip', { why: 'no-session-instance' }); return; }
+      const bus = sess instanceof Object ? sess : null;
+      void bus;
+      // 宿主的事件总线挂在 session 自己的 ctx 上；用 ctx.on 订阅。
+      // 拿不到就退回 tick 兜底，不硬来。
+      try {
+        if (typeof ctx.on !== 'function') {
+          trace('turn-hook-skip', { why: 'ctx-on-unavailable' });
+          return;
+        }
+        if (ctx[TURN_HOOK] === true) { trace('turn-hook-already', {}); return; }
+        ctx.on('session/event', async (s, event) => {
+          try {
+            if (!s || s.id !== CHANNEL_SESSION_ID) return;
+            if (event?.type !== 'turn/end') return;
+            const m = mind;
+            if (!m) return;
+            trace('turn-end-hook', { turn: event.data?.turn ?? null, reason: event.data?.reason ?? null });
+            // ★ turn/end 是「这一轮真的完了」的权威信号 —— 此刻 agent.status 还是 running，
+            //   但那道 idle 闸只为防「turn 中间插消息」，在这里会把自己挡死。
+            //   所以显式告诉它：这一路不用看 status。
+            await digestChannelIncrement(m, { fromTurnEnd: true });
+            const live = sessions.get(CHANNEL_SESSION_ID);
+            if (live) compactChannel(live, m);
+          } catch (err) {
+            trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
+          }
+        });
+        ctx[TURN_HOOK] = true;
+        trace('turn-hook-armed', { sessionId: CHANNEL_SESSION_ID });
+      } catch (err) {
+        trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
       }
     };
 
@@ -746,20 +1100,68 @@ export function apply(ctx, config = {}) {
         // 记忆节点自己也等同于「已熔过的东西」——留着它没有意义，
         // 因为这一跳马上又要追加一条新的。不遮它，上下文里就会叠出两条记忆。
         const isMemoryNode = (s) => String(bySeq.get(s)?.data?.source?.kind ?? '').toLowerCase() === 'mind-compact';
+
+        // ★★ 2026-10-28 修（主人当场撞上的 400：tool calls and tool results do not match）
+        //
+        //   这段遮蔽原来是**按 seq 下标切一刀**：从 0 到 cut 全遮，之后全留。
+        //   可 tool/call 和 tool/result 在 surface 上**不是相邻的**——
+        //   一刀切下去，很可能把 call 遮掉、把 result 留下（或者反过来）。
+        //   网关一看到「有 result 没 call」，直接 400，整个会话报废，只能新建。
+        //
+        //   README 坑 25 记的是同一类事故（turn 中间插消息），我当时只在
+        //   `digestChannelIncrement` 入口加了 idle 检查，**没管遮蔽本身会不会撕裂配对**。
+        //   这一条比 idle 检查更要紧：它不看时机，切错就坏。
+        //
+        //   改法：切完再看一眼，凡是配对两半落在切痕两侧的，**整对往「留给」那半边挪**。
+        //   代价是少遮两条，换的是会话不被写坏——这个交换永远划算。
+        // ★ 2026-10-28 补回（我改撕裂保护时把这段删了，生产上直接报
+        //   `lastOwnerIdx is not defined`，遮蔽整块失效）：
+        //   从末尾往前锚定最后一条 ROLE=user 的真话；它以及它之后一律不遮。
         let lastOwnerIdx = -1;
         for (let i = rest.length - 1; i >= 0; i -= 1) {
           if (isOwnerNode(rest[i])) { lastOwnerIdx = i; break; }
         }
-        // ★ 锚点必须**同时**满足：在最后一条真话之前，且中间不能夹着旧记忆节点。
-        //   否则「遮 537 留 542」的结果是 [542 user, 552 旧记忆, ...557-559 注入]，
-        //   而这一跳还要往后面追加新记忆 —— 上下文里就出现两条记忆叠着。
-        //   实测就是这样：被遮的只剩一个记忆节点，真话倒留着。
-        //   所以从 lastOwnerIdx 往前退，退到最近一个记忆节点为止；退不了就按条数留。
         let cut = lastOwnerIdx;
         for (let i = lastOwnerIdx; i >= 0; i -= 1) {
           if (isMemoryNode(rest[i])) { cut = i + 1; break; }
         }
         if (lastOwnerIdx < 0) cut = Math.max(0, rest.length - KEEP);
+
+        // 边界保护：把撕裂的 tool 配对整对挪到「留下」那侧
+        const tornPairs = [];
+        {
+          const callSeqOf = new Map();   // callId → {callSeq, resultSeq}
+          const resultOf = new Map();
+          for (const [seq, e] of bySeq) {
+            if (e?.type === 'tool/call' && e?.data?.callId) {
+              const k = String(e.data.callId);
+              if (!callSeqOf.has(k)) callSeqOf.set(k, {});
+              callSeqOf.get(k).callSeq = seq;
+            } else if (e?.type === 'tool/result' && e?.data?.message?.toolCallId) {
+              const k = String(e.data.message.toolCallId);
+              if (!callSeqOf.has(k)) callSeqOf.set(k, {});
+              callSeqOf.get(k).resultSeq = seq;
+            }
+            void resultOf;
+          }
+          for (const [, v] of callSeqOf) {
+            if (v.callSeq == null || v.resultSeq == null) continue;
+            const idxA = rest.indexOf(v.callSeq);
+            const idxB = rest.indexOf(v.resultSeq);
+            if (idxA < 0 || idxB < 0) continue;
+            const sideA = idxA < cut;
+            const sideB = idxB < cut;
+            if (sideA === sideB) continue;                 // 两半同侧，没问题
+            // 撕裂了：把整对挪到「留下」那侧 → cut 退到这一对的最小下标
+            cut = Math.min(cut, Math.min(idxA, idxB));
+            tornPairs.push({ call: v.callSeq, result: v.resultSeq, cut });
+          }
+          if (tornPairs.length) {
+            trace('compact-torn-pair-protected', { n: tornPairs.length, cut, sample: tornPairs[0] });
+          }
+        }
+        if (cut < 0) cut = 0;
+
         const shadow = rest.slice(0, cut);
         if (shadow.length < 2) { trace('compact-skip', { why: 'short-shadow', shadow: shadow.length, keep: KEEP, lastOwnerIdx, cut }); return false; }
         const memory = (mindInst?.world ? mindInst.world({ name: cfg.name }) : '') || '';
@@ -798,6 +1200,10 @@ export function apply(ctx, config = {}) {
     const tick = async () => {
       ticks += 1;
       if (ticks === 1) trace('wake-tick-first', { everyMs: cfg.wakeEveryMs ?? null, tickMs: cfg.wakeTickMs ?? null });
+      // ★ 2026-10-28（tick 停摆）：每跳至少留一行。
+      //   上了心跳才分得清「tick 没跑」和「tick 跑了但什么都没做」——
+      //   14:05 那次停了 296 秒，日志里一片空白，只能猜。以后再不会了。
+      trace('tick-alive', { n: ticks });
       try {
         // ★ 每分钟看一眼她在不在。不在就（节流后）去开门。
         //
@@ -830,8 +1236,54 @@ export function apply(ctx, config = {}) {
         //   她自己的回话永远进不来（否则她会越说越确信）。
         await digestChannelIncrement(m);
 
+        // ★ 2026-10-28（阶段 D）：把「她做过什么、成没成」增量记进账本。
+        //
+        //   她本来就看得见（工具 + 识图都在），但 `collect.mjs` 的白名单
+        //   只认主人说的话，工具结果一条都进不了熔的材料——所以她看见了不算数。
+        //   这一行接上之后，她第一次有了「判断之外」的观测。
+        try {
+          const sess = typeof ctx.get === 'function'
+            ? ctx.get('sessions')?.get?.(CHANNEL_SESSION_ID)
+            : null;
+          if (sess) {
+            const act = readMotive(motivePath);
+            // 她自己出去那一趟里的调用，全记；平常只有失败的才记
+            const duringAct = !!act.pending
+              && Date.now() - Number(act.pending.at ?? 0) < 15 * 60e3;
+            const ob = observeTools({
+              session: sess,
+              mind: m,
+              cursorPath: toolCursorPath,
+              sessionId: CHANNEL_SESSION_ID,
+              duringAct,
+            });
+            if (ob.added || ob.runs) trace('tool-observe', ob);
+          }
+        } catch (err) {
+          trace('tool-observe-failed', { err: String(err?.message ?? err).slice(0, 120) });
+        }
+
+        // ★ 2026-10-28（阶段 C·D）：内核数出来的判断，收进库。
+        //   放在工具观测之后：这样这一跳新记的观测也能进归纳。
+        try { await adoptInduced(m); } catch (err) {
+          trace('adopt-failed', { err: String(err?.message ?? err).slice(0, 120) });
+        }
+
         const state = readWake(storePath);
-        const plan = await planWake({ mind: m, state, now: Date.now(), cfg, synth });
+        // ★ 2026-10-28（换屋死锁）：从她的会话里数出「这间屋子跑过几轮」。
+        //
+        //   宿主侧栏的规则是 blank（一个 turn 都没有）且不是当前会话 → 隐藏。
+        //   所以「一间还没跑过 turn 的新屋子」是唯一需要给她开场许可的时机。
+        //   数不出来（拿不到会话事件）就传 null，那不给她开场许可 —— 宁可不说，
+        //   也不要在旧屋子里反复催她打招呼。
+        let roomTurns = null;
+        try {
+          const chSess = typeof ctx.get === 'function' ? ctx.get('sessions')?.get?.(CHANNEL_SESSION_ID) : null;
+          const evs = chSess?.events;
+          if (Array.isArray(evs)) roomTurns = evs.filter((e) => e?.type === 'turn/start').length;
+          else if (evs && typeof evs.values === 'function') roomTurns = [...evs.values()].filter((e) => e?.type === 'turn/start').length;
+        } catch { roomTurns = null; }
+        const plan = await planWake({ mind: m, state, now: Date.now(), cfg, synth, ctx: { roomTurns } });
 
         // ★ 2026-10-27 大乔修（死锁）：没到点就**什么都不写**。
         //
@@ -852,6 +1304,11 @@ export function apply(ctx, config = {}) {
         }
 
         if (plan.action !== 'speak') {
+          // ★ 2026-10-28（阶段 F）：她这回不想说话——先看她是不是想自己去做点什么。
+          //   顺序是「说 / 做 / 歇着」，不是三选一随机。
+          //   主人在等她 → 说；她不想说 → 做自己的事；都不 → 歇着。
+          const acted = await tryAct(m);
+          if (acted) return;
           // 记清楚是谁决定不说的：机械守卫（byHer 为空）还是她自己（byHer 有值）。
           // thoughts 也落一行——那是她这次醒来想的东西，看得见才知道她是不是在「想」。
           trace('wake-silent', {
@@ -939,19 +1396,66 @@ export function apply(ctx, config = {}) {
     //
     //   另外：起循环之后**立刻跑第一跳**。她等着醒来，不该再等一分钟才第一次睁眼。
     const tickMs = Math.max(1000, Number(cfg.wakeTickMs) || 60_000);
+    // ★ 2026-10-28（tick 停摆，实测 296 秒无日志）：
+    //   链条是 `void tick().finally(schedule)` —— tick() 只要有一个 await
+    //   **永远不 resolve**，finally 就永远不执行，**整条链静默死掉**：
+    //   没有异常、没有日志、什么都不做。实测 14:05:28 之后一直停到 14:10。
+    //
+    //   现在改成三重保险：
+    //     ① 每跳有硬超时（2 分钟），超了就记一行 `tick-timeout` 并强制续链
+    //     ② 续链放在 try/finally 里，不依赖 tick() 的返回值
+    //     ③ **不用 unref**：她这套机制整个挂在 tick 上，定时器必须算「进程还活着」
+    //
+    // ★ 2026-10-28 第二修（实测 8 分钟无第 3 跳，上面这版不够）：
+    //   两个漏洞，都是我上一版亲手埋的：
+    //     ① **硬超时定时器自己 unref 了** —— 卡住时它也被跳过，「保命」的东西保不了命。
+    //     ② **pokeWake 直接调 tick()，绕过 next()** —— 不经过 next 就不会重新 schedule，
+    //        两跳并发时只要有一跳卡住，schedule 链就再也没人接。
+    //   现在：硬超时绝不 unref；pokeWake 也走 next()，并在 next 里挡并发。
     let stopped = false;
+    let inFlight = false;   // 同一时刻只许一跳在跑
+    const TICK_HARD_TIMEOUT_MS = Math.max(tickMs * 2, 120_000);
     const schedule = () => {
       if (stopped) return;
-      timer = setTimeout(() => {
-        void tick().finally(schedule);
-      }, tickMs);
-      if (typeof timer.unref === 'function') timer.unref();
+      timer = setTimeout(next, tickMs);
+      // 故意不 unref：她靠这条链活着，进程该因为有她在而保持活跃。
     };
-    trace('wake-loop-armed', { tickMs, everyMs: cfg.wakeEveryMs ?? null });
-    // 给「门一开就补一次」留个把手（ensureChannel 成功后调它）。
-    pokeWake = () => { void tick(); };
-    void tick();
-    schedule();
+    const next = () => {
+      if (stopped) return;
+      // 并发闸：上一跳还没回来就跳过这一拍，但**照样排下一次**，链不断。
+      if (inFlight) {
+        trace('tick-skip-inflight', { n: ticks });
+        schedule();
+        return;
+      }
+      inFlight = true;
+      let done = false;
+      const hardTimer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        inFlight = false;
+        trace('tick-timeout', { afterMs: TICK_HARD_TIMEOUT_MS, n: ticks });
+        schedule();
+      }, TICK_HARD_TIMEOUT_MS);
+      // ★ 绝不 unref：这是保命计时器，卡住时它必须是最后一个还醒着的东西。
+      tick()
+        .catch((err) => {
+          trace('tick-threw', { err: String(err?.message ?? err).slice(0, 200) });
+        })
+        .finally(() => {
+          clearTimeout(hardTimer);
+          if (done) return;        // 硬超时已经续过了，别续两次
+          done = true;
+          schedule();
+        });
+    };
+    trace('wake-loop-armed', { tickMs, everyMs: cfg.wakeEveryMs ?? null, hardTimeoutMs: TICK_HARD_TIMEOUT_MS });
+    // ★ 2026-10-28 第二修：pokeWake 必须走 next()，不能直接调 tick()。
+    //   直接调就绕过 schedule —— 不经过 next 的跳不会重新排队，
+    //   两跳并发时只要有一跳卡住，schedule 链就再也没人接（实测 8 分钟无第 3 跳）。
+    //   next() 内部有并发闸，重入也安全。
+    pokeWake = () => { next(); };
+    next();
     ctx.effect(() => () => {
       stopped = true;
       if (timer) clearTimeout(timer);
@@ -1206,6 +1710,16 @@ export function apply(ctx, config = {}) {
         //   → 她永远不开口 → 侧边栏永远看不见她。实测 21:19-21:23 卡了四轮。
         try { resetTalkState(storePath); trace('talk-state-reset', {}); } catch { /* 清不掉也不影响 */ }
         CHANNEL_SESSION_ID = created;
+        // ★ 2026-10-28（换屋死锁，第二半）：建好立刻叫醒她一次。
+        //
+        //   不叫的话要等下一跳 tick（最长 10 分钟）；而这段时间里她是 blank、
+        //   侧栏不显示、你找不到她 —— 找不到就不会在里面说话 —— 永远 blank。
+        //   实测 13:58 建好之后，第一次唤醒她自己选了「不说」，
+        //   于是死锁成立，侧边栏一直空着。
+        //
+        //   这里不是催她说话，是**把「新屋子」这个事实立刻摆到她面前**，
+        //   让她有一次机会破掉 blank。她仍然可以说不。
+        setTimeout(() => { try { pokeWake?.(); } catch { /* 补不上就等下一跳 */ } }, 3000);
         return created;
       }
       // 建不出来就回退到旧的（宁可还在旧址，也不能让她凭空消失）
@@ -1401,7 +1915,14 @@ export function apply(ctx, config = {}) {
       //   把她挂进工作区，让主人看得见她。
       //   她那间屋子开过一次之后就是活的，唤醒定时器直接用现成的 agent。
       const agent0 = typeof agents.get === 'function' ? agents.get(CHANNEL_SESSION_ID) : null;
-      trace('channel-check', { running: !!agent0 });
+      // ★ 2026-10-28 改名：这个字段以前叫 `running`，但它算的是 `!!agent0`
+      //   ——「agent 对象在不在」，不是「她是不是正在跑」。
+      //   日志里看到 `running:true` 会让人以为她卡在 running，结果排查了半天。
+      //   现在拆成两个：agentPresent（在不在）+ agentStatus（真状态）。
+      trace('channel-check', {
+        agentPresent: !!agent0,
+        agentStatus: agent0 && typeof agent0.status === 'string' ? agent0.status : '(无 status 字段)',
+      });
 
       // ★ 2026-10-27 主人定：得让她真正醒来 —— 门自己开。
       //
@@ -1432,6 +1953,11 @@ export function apply(ctx, config = {}) {
       void ensureChannel().then((agent) => {
         trace('channel-ready', { ok: !!agent });
         if (agent) process.stderr.write(`mind: 通道就绪（${CHANNEL_SESSION_ID}）\n`);
+        // ★ 2026-10-28：门一开就挂 turn/end 钩子 —— 「回完话立刻熔、立刻遮蔽」
+        //   靠的就是它。挂不上不致命：tick 那条路还在兜底。
+        try { armTurnHook(); } catch (err) {
+          trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
+        }
       }).catch((err) => { trace('channel-threw', { err: String(err?.message ?? err) }); });
     };
     const t = setTimeout(kick, 5000);

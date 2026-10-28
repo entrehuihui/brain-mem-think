@@ -43,14 +43,19 @@ export function isAboutSelf(n) {
   return body.startsWith('我');
 }
 
+/** 一条判断在她心里的份量：strength（证据算出来的）优先，老数据回退 weight。 */
+function mag(n) {
+  return Number(n?.strength ?? n?.weight) || 0;
+}
+
 /** 心境是从判断现算的：不存，每次睁开眼重新算。 */
 export function moodOf(notes) {
   const live = notes.filter((n) => n.status === 'open' || n.status === 'held');
   if (!live.length) return { word: '平静', tone: 0, because: '心里没什么压着的' };
   const held = live.filter((n) => n.status === 'held');
   const open = live.filter((n) => n.status === 'open');
-  const heavy = [...live].sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))[0];
-  const avg = live.reduce((s, n) => s + (n.weight ?? 0), 0) / live.length;
+  const heavy = [...live].sort((a, b) => mag(b) - mag(a))[0];
+  const avg = live.reduce((s, n) => s + mag(n), 0) / live.length;
   // tone：负 = 沉，正 = 轻。只由「压着的分量」和「悬着的数量」算，不掺别的。
   const tone = Math.max(-1, Math.min(1, (held.length ? avg : 0) * 0.6 - open.length * 0.15));
   let word = '平静';
@@ -124,7 +129,7 @@ export function renderWorld(beliefs, opts = {}) {
     return { ...base, status, text: body, note: body };
   });
 
-  const byWeight = (a, b) => (b.weight ?? 0) - (a.weight ?? 0);
+  const byWeight = (a, b) => mag(b) - mag(a);
   const held = notes
     .filter((n) => n.status === 'held' && (n.weight ?? 0) >= o.minWeightToShow)
     .sort(byWeight)

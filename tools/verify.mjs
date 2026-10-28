@@ -51,8 +51,13 @@ console.log('\n[②] 抄原文阈值（短材料放宽到 12 字）');
   const synth = { synthesize: async () => JSON.stringify({ judgments: [
     // 与材料撞 "把裙子撩起来一点" = 8 个汉字：旧阈值 8 会误杀，新阈值 12 放行
     { text: '他就是要我把裙子撩起来一点。', why: 'x', relation: 'wants', subject: '他', polarity: 'favorable', weight: 0.7 },
-    // 与材料完全不相撞：新旧都放行，用来确认不是「什么都放行」
-    { text: '他心里比我以为的更急。', why: 'y', relation: 'wants', subject: '他', polarity: 'favorable', weight: 0.6 },
+    // ★ 2026-10-28 改（跟 P0-3 一起改的，理由记在这儿）：
+    //   这条原来 why 只写了 'y'，测的是「跟材料完全不相撞也照常放行」。
+    //   可那正是 P0-3 那个后门：零共享 + 长度≥6 就过，编造长驱直入。
+    //   现在 grounding 的主路要求「正文或理由至少有一条线索落在材料上」，
+    //   所以这条用例的 why 改成贴材料的理由——它测的仍然是
+    //   「不相撞的抽象判断照常放行」，只是不再要求「连理由都不贴也放」。
+    { text: '他心里比我以为的更急。', why: '把裙子撩起来那一下他的手都没停', relation: 'wants', subject: '他', polarity: 'favorable', weight: 0.6 },
   ] }) };
   const r = await digestSession([material], { synth });
   const hit = r.judgments.find((j) => j.text.includes('撩起来'));

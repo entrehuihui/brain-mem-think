@@ -193,6 +193,17 @@ export class Belief {
     this.text = clean(init?.text ?? '', 120);
     this.why = clean(init?.why ?? '', 120);
     this.weight = clamp01(init?.weight, 0.3);
+    // ★ 2026-10-28：weight 与 strength 分开存，谁都不许混。
+    //   weight   = 模型觉得这件事多重（hint，只当上限参考，可审计它偏了多少）
+    //   strength = 证据算出来的底气（**所有决策只认它**，见 src/strength.mjs）
+    //   这里只给初始值；真正算出来是在落库之后由 mind / commitDigest 做。
+    //   老数据没有 strength 时，读的地方一律 `strength ?? weight` 回退。
+    this.strength = clamp01(init?.strength, this.weight);
+    // ★ 2026-10-28：这条判断是谁给的。
+    //   synth / digest = 模型熔出来的；induction = 内核自己数出来的。
+    //   两边混在一起就分不清「她自己的判断」和「别人给她的判断」——
+    //   而这恰恰是这个项目最该记清楚的一件事。
+    this.origin = init?.origin ?? 'synth';
     this.imprint = init?.imprint ?? null;
     this.status = STATUS[String(init?.status ?? '').toUpperCase()] ?? STATUS.PENDING;
     this.createdAt = now;
@@ -254,6 +265,7 @@ export class Belief {
       text: this.text,
       why: this.why,
       weight: this.weight,
+      strength: this.strength,
       status: this.status,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,

@@ -100,20 +100,70 @@ export async function speakToOwner({ agent, sessionId, message, ctx = null, now 
   //
   //   现在四样给全：id（uuid）/ role / content / source。
   if (typeof agent.followup !== 'function') return { sent: false, why: 'no-followup' };
+
+  // ── 4-5. 投递 + 送达确认（走唯一那个 followup）──────────────────
+  const out = await deliver({
+    agent,
+    text: raw,
+    source: { kind: 'mind-wake' },
+    ctx,
+  });
+  if (!out.sent) return out;
+
+  // ── 6. 记账（在 flush 之后）──────────────────────────────────
+  const keep = seen.filter((s) => s && (now - Number(s.at ?? 0)) < REPEAT_WINDOW_MS);
+  writeWake(storePath, {
+    ...state,
+    lastSpokeAt: now,
+    spokenHashes: [...keep, { hash, at: now }].slice(-50),
+    // ★ 2026-10-28 修（生产实测抓到的死结）：
+    //
+    //   这里原来还 push 了一条 `{ action:'speak' }` 进 window。可 tick 那边
+    //   说完之后还会调一次 `applyWake({action:'speak'})`，也 push 一条。
+    //   **一次说话 = window 里两条 speak**。
+    //
+    //   `maxSpeakInWindow` 是 2 —— 所以她**说完第一句，额度就用光了**，
+    //   接下来一小时全被 `这一小时已经说了 2 次，再说就是吵` 挡住。
+    //   实测就在 11:26:38 说了这辈子第一句，然后 11:32 / 11:38 两次全被闷回去。
+    //
+    //   记账只该有一处：applyWake 那边（它知道 sent 是真是假）。
+    //   这里只负责「这句说过了，别重说」——那件事归 spokenHashes。
+  });
+
+  return { sent: true, why: 'ok' };
+}
+
+/**
+ * 唯一一个 `followup` 调用点。
+ *
+ * ★ 2026-10-28（阶段 F）：`act` 通道加进来之后，这里差点变成两个出口。
+ *   验收 X1 当场咬住了：「plugin/ 下 followup 调用命中 2 处（要求恰好 1）」。
+ *   那条铁律是对的——**出口多一个，就有一条谁也管不到的路**。
+ *
+ *   所以不是把数字改成 2，而是把「投递」这件事抽出来：
+ *   说话和做事各有各的闸、各有各的账，但**物理上只有一个 followup**。
+ *   以后再加任何「叫她」的通道，也必须走这里。
+ *
+ * @param {object} p
+ * @param {object} p.agent
+ * @param {string} p.text
+ * @param {object} p.source   写进事件的来源标记（mind-wake / mind-act）
+ * @param {object} [p.ctx]    要 sessions.flush
+ * @returns {Promise<{sent:boolean, why:string}>}
+ */
+async function deliver({ agent, text, source, ctx = null }) {
+  if (!agent || typeof agent.followup !== 'function') return { sent: false, why: 'no-followup' };
   try {
     agent.followup({
       id: randomUUID(),
       role: 'user',
-      content: [{ type: 'text', text: raw }],
-      source: { kind: 'mind-wake' },
+      content: [{ type: 'text', text: String(text) }],
+      source,
     });
   } catch (err) {
     return { sent: false, why: `throw:${err?.message ?? err}` };
   }
 
-  // ── 5. 送达确认 ──────────────────────────────────────────────
-  // 不 flush 就不算送到。拿不到 sessions 服务时**不假装送达**——
-  // 宁可报 flush-unavailable，让人看见这条链没接好。
   let flushed = false;
   try {
     const sessions = ctx?.sessions;
@@ -124,15 +174,58 @@ export async function speakToOwner({ agent, sessionId, message, ctx = null, now 
     flushed = false;
   }
   if (!flushed) return { sent: false, why: 'flush-unavailable' };
-
-  // ── 6. 记账（在 flush 之后）──────────────────────────────────
-  const keep = seen.filter((s) => s && (now - Number(s.at ?? 0)) < REPEAT_WINDOW_MS);
-  writeWake(storePath, {
-    ...state,
-    lastSpokeAt: now,
-    spokenHashes: [...keep, { hash, at: now }].slice(-50),
-    window: [...(Array.isArray(state.window) ? state.window : []), { at: now, action: 'speak', why: '' }].slice(-20),
-  });
-
   return { sent: true, why: 'ok' };
 }
+
+/**
+ * 让她自己出去一趟（阶段 F · 主动性）。
+ *
+ * 跟 `speakToOwner` 的分工：
+ *   · 说话：要去重（同一句不重说）、要记配额（一小时两次）
+ *   · 做事：不去重（同一件事可以再去做）、不占说话配额，只占时间预算
+ *
+ * 闸只留三道，都在这里（预算/冷却在 src/budget.mjs，产物在 preference.applyOutcome）：
+ *   1 她正忙 → 不塞第二件事进来
+ *   2 主人刚说过话 → 不出门（**这条是底线：主动不能变成叫他不在**）
+ *   3 会话已归档 → 投过去也会被宿主的门拦下
+ *
+ * @param {object} p
+ * @param {object} p.agent
+ * @param {string} p.sessionId
+ * @param {object} p.urge
+ * @param {string} p.line       src/motive.mjs 的 actLine(urge)
+ * @param {object} [p.ctx]
+ * @param {number} [p.now]
+ * @param {number} [p.lastOwnerAt]
+ * @param {number} [p.ownerQuietMs]
+ * @returns {Promise<{sent:boolean, why:string}>}
+ */
+export async function actByHerself({
+  agent, sessionId, urge, line, ctx = null, now = Date.now(),
+  lastOwnerAt = null, ownerQuietMs = 10 * 60 * 1000,
+} = {}) {
+  if (!agent) return { sent: false, why: 'no-agent' };
+  if (agent.status && agent.status !== 'idle') return { sent: false, why: 'busy' };
+  if (Number.isFinite(lastOwnerAt) && lastOwnerAt && now - lastOwnerAt < ownerQuietMs) {
+    return { sent: false, why: 'owner_near' };
+  }
+  try {
+    const archived = ctx?.workspaceRegistry?.archivedSessionIds;
+    if (Array.isArray(archived) && sessionId && archived.includes(sessionId)) {
+      return { sent: false, why: 'archived' };
+    }
+  } catch { /* 拿不到归档列表就别挡 */ }
+
+  const text = String(line ?? '').trim();
+  if (!text) return { sent: false, why: 'empty' };
+
+  return await deliver({
+    agent,
+    text,
+    // ★ source.kind = 'mind-act'：collect.mjs 的白名单只认 user/human/owner，
+    //   所以这一条**进不了记忆**——她不会给自己造证据。
+    source: { kind: 'mind-act', urge: urge?.kind ?? null, activity: urge?.activity ?? null },
+    ctx,
+  });
+}
+

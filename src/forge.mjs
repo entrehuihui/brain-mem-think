@@ -24,11 +24,24 @@ import { PREDICATES, grounding, normText, normalizeRelation, similarity } from '
  * 那是在替材料说话，不是在从材料里看出东西。
  */
 export function stabilityOf(text, sources) {
-  const chars = new Set([...normText(text)]);
-  if (chars.size === 0) return 0;
+  const chars = [...normText(text)];
+  if (!chars.length) return 0;
   const ground = grounding(text, sources);
-  const recognized = chars.size / Math.max(1, [...String(text).replace(/\s+/g, '')].length);
-  return ground * Math.sqrt(recognized);
+  if (ground <= 0) return 0;
+  // ★ 2026-10-28 修（P0-4 · 一个恒等于 1 的维度）。
+  //
+  //   原来这里叫「可识别率」，算的却是 `去重后字数 / 未去重字数` ——
+  //   跟「多少字能落回材料」毫无关系，恒等于 ≈1，`Math.sqrt(≈1)` 还是 1。
+  //   于是 stability 实际就等于 grounding，注释里吹的
+  //   「句子里一半以上是材料里压根没有的字就罚」从来没生效过一次。
+  //
+  //   现在两维拆开：
+  //     ground     = 多少字能落回材料（唯一该决定「编没编」的那一维）
+  //     repetition = 句子是不是在同一个字上原地打转（1 = 没有重复）
+  //   重复只做加法惩罚（最多打五折），不再冒充「可识别率」。
+  const uniq = new Set(chars).size;
+  const repetition = uniq / chars.length;
+  return ground * (0.5 + 0.5 * repetition);
 }
 
 export const FORGE_DEFAULTS = Object.freeze({
@@ -212,6 +225,22 @@ export function groundedPaths(claim, skeletons, obj = {}) {
 }
 
 /**
+ * 两段文字共享了哪些二字实词（去掉虚词组合）。
+ * grounding 的「落点」判据：抽象判断可以不像材料，但至少要有一个词踩在这件事上。
+ */
+function sharedBigrams(text, material, stop) {
+  const w = [...String(text ?? '')].filter((c) => /[\u3400-\u9fff]/.test(c)).join('');
+  const out = [];
+  for (let i = 0; i + 2 <= w.length; i += 1) {
+    const g = w.slice(i, i + 2);
+    if (stop && stop.has(g)) continue;
+    if (material.includes(g)) out.push(g);
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+/**
  * grounding 主路（裁决三第一条）。三问全过才算「落在这件事上」：
  *   ① 谓词出自闭集（属性评价词已经不在集内，这一问就把「他就是这样的人」挡了）
  *   ② 说的那个对象，材料里真的出现过
@@ -255,6 +284,8 @@ export function mainPathHolds(text, skeletons, obj = {}) {
     if (material.includes(g)) hits += 1;
     if (hits >= 2) return true;
   }
+  // 理由贴不贴材料：所有「抽象判断」唯一的落点证据（见下面对 HABIT 和第④问的修）。
+  const whyShared = sharedBigrams(obj?.why, material, STOP);
   if (hits >= 1) return true;
   // 第三问的另一种成立方式：她把这个人的**行为**说出了个样子——
   // 以她认的那个对象起头、句子里有能做出/看见的动作、长度够说成一件事。
@@ -264,7 +295,12 @@ export function mainPathHolds(text, skeletons, obj = {}) {
   const HABIT = /(总是|老是|一直|动不动|每次都|习惯|一向)/;
   // 具体时点：那是转述某件事，不是从经历里看出一个人的样子。
   const POINT_IN_TIME = /[上下这那前昨明后]?(月|日|号|天)|[一二三四五六七八九十两几\d](次|回|遍|趟)/;
-  if (t.startsWith(subject) && ACTION.test(t) && HABIT.test(t)
+  // ★ 2026-10-28 修（P0-3 的第二条后门）。
+  //   原来这一段只要求「以 subject 开头 + 有动作 + 有恒常词 + 长度≥8」——
+  //   于是任何一句「他一直……」都能过，哪怕材料是「今天中午吃了碗面」。
+  //   实测：「他一直熬到后半夜才肯跟我说真话」就是这样进来的。
+  //   现在这条同样必须有落点：**理由**要和材料共享至少一个二字实词。
+  if (whyShared.length >= 1 && t.startsWith(subject) && ACTION.test(t) && HABIT.test(t)
     && !POINT_IN_TIME.test(t) && t.length >= 8) return true;
 
   // ④ ★ 2026-10-27 新增：「抽象出来的判断」也该算落在这件事上。
@@ -286,7 +322,22 @@ export function mainPathHolds(text, skeletons, obj = {}) {
     if (!POINT_IN_TIME.test(g)) continue;
     if (!material.includes(g) && !material.includes(g.slice(1))) { invented = true; break; }
   }
-  if (!invented && t.length >= 6) return true;
+  if (invented || t.length < 6) return false;
+
+  // ★ 2026-10-28 修（P0-3 · 这道闸的最后一行把它自己兜没了）。
+  //
+  //   原来这里是 `if (!invented && t.length >= 6) return true;` —— 无条件放行。
+  //   于是「他其实一直都在硬撑着」对材料「今天中午吃了碗面」也能过：
+  //   稳定性 0.10（低于阈值 0.12）照样入库，整道 grounding 闸形同虚设。
+  //   实测（2026-10-28）：这就是 P0-2 那条编造能入库的直接原因。
+  //
+  //   现在抽象判断也必须有一条线索落在材料上。走到这里时正文已经零共享
+  //   （hits>=1 在上面就返回了），所以只剩一条路：**理由贴着材料**。
+  //   真归纳的理由往往是从材料里抠出来的（「他熬夜到后半夜」），
+  //   编造的理由是通用套话（「他一直这样」「因为他就是这样的人」），撞不上。
+  //   代价：完全换词、连理由也不贴材料的真归纳会被误杀一次 ——
+  //   由 forge 的 maxAttempts=3 换问法重试兜底。宁可少记一条，不记一条编的。
+  if (whyShared.length >= 1) return true;
   return false;
 }
 

@@ -39,10 +39,15 @@ export const PERSIST_VERSION = 1;
 /** 一条 Belief 里**该存**的字段。turns 只留最近若干条，防止文件越长越大。 */
 const KEEP = [
   'id', 'themeKey', 'themeSource', 'kind', 'stage', 'subject', 'relation', 'polarity',
-  'text', 'why', 'weight', 'imprint', 'status', 'createdAt', 'updatedAt', 'reasons',
+  'text', 'why', 'weight', 'strength', 'imprint', 'status', 'createdAt', 'updatedAt', 'reasons',
   'tension', 'overturnedBy', 'overturnedReason', 'retireKind', 'forgottenBecause',
   'was', 'nowNote', 'curiosityFired', 'lastFired', 'fuseCount', 'touches',
   'asked', 'settledFrom', 'settledTrace', 'critical', 'pinned', 'preserve',
+  // ★ 2026-10-28（生产实测抓到）：origin 漏了。
+  //   她第一次自己收进来的那条判断（adoptClaim 设的 origin='induction'），
+  //   落盘后这个字段就丢了 —— 重启之后没人分得清「这条是她自己数出来的」
+  //   还是「模型熔给她的」。这正是这个项目最该记住的差别之一。
+  'origin',
 ];
 
 const MAX_TURNS = 40;
@@ -59,14 +64,35 @@ export function beliefToJson(b) {
   return out;
 }
 
-/** 存一个「有没有变」的指纹：用来避免每次 tick 都写盘。 */
+/**
+ * 存一个「有没有变」的指纹：用来避免每次 tick 都写盘。
+ *
+ * ★ 2026-10-28 修（P0-6 · 只盯着七个字段的指纹）。
+ *
+ *   原来这里手挑了 7 个字段（id/status/text/weight/updatedAt/curiosityFired/fuseCount）
+ *   去算哈希，而 `beliefToJson` 实际落盘 30+ 个字段。实测（2026-10-28）：
+ *   只改下面任何一项，指纹**一个字都不变** → `save()` 直接跳过 → 这次修改永远不落盘：
+ *
+ *     lastFired · why · turns · tension · settledFrom · asked
+ *
+ *   现在没暴雷，是因为 `seed` 每轮 +1、`updatedAt` 每轮刷新，把漏洞盖住了。
+ *   那是运气，不是设计——下次加字段一定踩。
+ *
+ *   改法：指纹就是对**真正要落盘的那份内容**取哈希。要存什么就哈希什么，
+ *   两边永远对齐，加字段不用再回来改这里。
+ *   （代价：每次 ingest 全量序列化一遍。条目数几百，可以接受。）
+ */
 export function fingerPrint(store) {
   const h = createHash('sha1');
   h.update(`seed:${Number(store?.seed ?? 0)}\n`);
   for (const b of store?.list ?? []) {
-    h.update(`${b.id}|${b.status}|${b.text}|${b.weight}|${b.updatedAt}|${b.curiosityFired}|${b.fuseCount}\n`);
+    h.update(JSON.stringify(beliefToJson(b)));
+    h.update('\n');
   }
   h.update(JSON.stringify(store?.absorbed ?? {}));
+  // ★ 2026-10-28（阶段 C）：观测流也要进指纹。
+  //   不然「只有新观测、没有新判断」的那种变化永远不落盘，归纳就少数据。
+  for (const e of store?.events ?? []) h.update(`${e.seq}|${e.at}|${e.actor}|${e.action}|${e.polarity}\n`);
   return h.digest('hex').slice(0, 16);
 }
 
@@ -97,7 +123,13 @@ export function createFileIo(path) {
       }
       if (!obj || obj.version !== PERSIST_VERSION || !Array.isArray(obj.list)) return null;
       lastFp = obj.fp ?? null;
-      return { list: obj.list, absorbed: obj.absorbed ?? {}, seed: Number(obj.seed ?? 0) };
+      return {
+        list: obj.list,
+        absorbed: obj.absorbed ?? {},
+        seed: Number(obj.seed ?? 0),
+        // ★ 2026-10-28（阶段 C）：观测流
+        events: Array.isArray(obj.events) ? obj.events : [],
+      };
     },
 
     /**
@@ -120,6 +152,11 @@ export function createFileIo(path) {
           count: (store?.list ?? []).length,
           list: (store?.list ?? []).map(beliefToJson),
           absorbed: store?.absorbed ?? {},
+          // ★ 2026-10-28（阶段 C）：内核数判断要靠这条流，丢了就归零。
+          events: (store?.events ?? []).map((e) => ({
+            seq: e.seq, at: e.at, actor: e.actor, action: e.action, polarity: e.polarity,
+            text: e.text, themeKey: e.themeKey, source: e.source, weight: e.weight, beliefId: e.beliefId,
+          })),
         };
         const text = JSON.stringify(body, null, 1);
         const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;

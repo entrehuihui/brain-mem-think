@@ -68,16 +68,60 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 /**
- * 从宿主拿到 { provider, model }。
- * 优先用这个会话当前选的模型；拿不到再退回配置里的默认值。
+ * 从宿主拿到 { provider, model }。一级一级往下退：
+ *
+ *   ① 配置里写死了 synthProvider + synthModel → 锁死，绝不漂
+ *   ② 新建会话的默认模型（`agentDefaultModel.currentSelection()`）
+ *   ③ 只配了 model、没配 provider → 从 llm 的可用 provider 里配一个
+ *   ④ 真什么都没有 → null（宁可哑着，也不瞎挑一个去调）
+ *
+ * ======================= 两级「默认」要说清 =======================
+ *
+ * 很多人（包括我之前一版）会把 `agentDefaultModel.currentSelection()`
+ * 当成「当前打开的那个会话用的模型」。**不是。**
+ *
+ * 它读的是 `agent-default-model` 这个服务自己的配置
+ * （`dsh-agent-default-model/lib/index.js:38`），也就是**新建会话时套用的默认**。
+ * 它会在设置里被改，但不会因为你在不同会话之间切换而变。
+ *
+ * 所以「跟着主人看哪个会话漂」这个说法是错的——那个漂是「默认设置被动过」。
+ * 日志里出现三个 route，就是因为这个设置被改过三次。
+ *
+ * ======================= 为什么配死排第一 =======================
+ *
+ * 原来的写法是 `sel?.provider ?? cfg?.synthProvider`——currentSelection 永远优先，
+ * 于是**在配置里写死也没用**，配了等于白配。
+ * 她的活是熔记忆、说一句话、把判断说成人话；用哪个模型该由主人一次定死，
+ * 不该跟着一个全局设置漂。
  */
-function pickModel(defaultModel, cfg) {
+function pickModel(defaultModel, cfg, llm) {
+  // ① 配死
+  if (cfg?.synthProvider && cfg?.synthModel) {
+    return { provider: String(cfg.synthProvider), model: String(cfg.synthModel) };
+  }
+
+  // ② 新建会话的默认模型
   let sel = null;
   try { sel = defaultModel?.currentSelection?.() ?? null; } catch { sel = null; }
-  const provider = sel?.provider ?? cfg?.synthProvider ?? '';
-  const model = sel?.model ?? cfg?.synthModel ?? '';
-  if (!provider || !model) return null;
-  return { provider, model };
+  if (sel?.provider && sel?.model) {
+    return { provider: String(sel.provider), model: String(sel.model) };
+  }
+
+  // ③ 只配了 model：provider 从可用列表里挑
+  if (cfg?.synthModel) {
+    let providers = [];
+    try { providers = llm?.listProviders?.() ?? []; } catch { providers = []; }
+    const wanted = String(cfg.synthProvider ?? '');
+    // ★ 别写成 `(wanted && find()) ?? providers[0]`：
+    //   `wanted` 是空串时，`'' && ...` 得 `''`，而 `'' ?? x` 仍然是 `''`
+    //   ——?? 只对 null/undefined 生效，空串会直接穿过去，结果挑不到 provider。
+    //   （这条是单测抓出来的，不是想出来的。）
+    const pick = (wanted ? providers.find((x) => x?.id === wanted) : null) ?? providers[0];
+    if (pick?.id) return { provider: String(pick.id), model: String(cfg.synthModel) };
+  }
+
+  // ④ 确实没有
+  return null;
 }
 
 /**
@@ -95,7 +139,22 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
   let out = '';
   let reasoned = 0;
   const seen = {};
-  try {
+
+  // ★★ 2026-10-28（tick 停摆，实测 296 秒无日志）—— 这一段的写法是被实验推翻过一次的。
+  //
+  //   第一版我在 for await 循环**里面**判断 `Date.now() > deadline`。
+  //   实测证明它救不出来：只要 `await` 卡在「等下一个 chunk」上，
+  //   循环体一次都不执行，那个判断根本没机会跑。
+  //   （探针：给一个永远不吐 chunk 的流，第一版 15 秒都没逃出来。）
+  //
+  //   真正的墙必须在**外面**：把整个消费过程塞进一个 Promise，
+  //   再和「到点就 reject 的定时器」赛跑。谁先到都算数，
+  //   落败的那一边由 finally 清掉 —— 不再依赖流自己肯不肯结束。
+  //
+  //   为什么要这么狠：tick 是 `await tick()`，只要有一个 await 永不 resolve，
+  //   整条链静默死掉 —— 没有异常、没有日志、什么都不做。
+  //   她整套机制（熔、唤醒、主动、观测）全挂在 tick 上。
+  const consume = async () => {
     const stream = llm.stream({
       provider: route.provider,
       model: route.model,
@@ -117,12 +176,27 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
       }
       if (out.length > 6000) break; // 防跑飞
     }
+  };
+
+  const WALL = Math.max(15_000, Number(tmo) + 5_000);
+  let wallTimer = null;
+  const wall = new Promise((_, reject) => {
+    wallTimer = setTimeout(() => {
+      try { controller.abort(); } catch { /* 已经断了就算了 */ }
+      reject(new Error(`mind: model stream wall-clock timeout (${WALL}ms)`));
+    }, WALL);
+    if (typeof wallTimer.unref === 'function') wallTimer.unref();
+  });
+
+  try {
+    await Promise.race([consume(), wall]);
   } catch (err) {
     // 模型一次没答上来，不该让这一轮崩；调用方会把它当「这锅没熔出东西」。
     onError?.(String(err?.message ?? err));
     return null;
   } finally {
     clearTimeout(timer);
+    clearTimeout(wallTimer);
   }
 
   const said = out.trim();
@@ -156,7 +230,7 @@ export function createSynth(scope, cfg = {}, onError = null) {
   return {
     /** 宿主模型名，供日志对照。 */
     get route() {
-      const m = pickModel(defaultModel, cfg);
+      const m = pickModel(defaultModel, cfg, llm);
       return m ? `${m.provider}/${m.model}` : null;
     },
 
@@ -168,7 +242,7 @@ export function createSynth(scope, cfg = {}, onError = null) {
       const sys = String(system ?? '').trim();
       const text = String(material ?? '').trim();
       if (!sys || !text) return null;
-      const route = pickModel(defaultModel, cfg);
+      const route = pickModel(defaultModel, cfg, llm);
       if (!route) return null;
       return await streamText({
         llm,
@@ -186,7 +260,7 @@ export function createSynth(scope, cfg = {}, onError = null) {
     async synthesize(material) {
       const text = String(material ?? '').trim();
       if (!text) return null;
-      const route = pickModel(defaultModel, cfg);
+      const route = pickModel(defaultModel, cfg, llm);
       if (!route) return null;
       return await streamText({
         llm,

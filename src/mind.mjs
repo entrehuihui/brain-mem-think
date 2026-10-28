@@ -34,6 +34,9 @@ import { createRevision } from './revision.mjs';
 import { createFlash, clause, toNote } from './flash.mjs';
 import { renderWorld } from './world.mjs';
 import { digestSession as runDigest, commitDigest } from './digest-session.mjs';
+import { strengthOfBelief, strengthFromEvidence } from './strength.mjs';
+import { eventFromBelief, eventFromJson, makeEvent } from './event.mjs';
+import { induce, reconcile } from './induct.mjs';
 
 /** 批次的临时分组键：还没熔出判断的材料暂时放在一起记账，它永远不落到任何一条判断上。 */
 const ORPHAN = '\u0000orphan';
@@ -120,6 +123,12 @@ export class Mind {
             this.store.add(b);
           }
           if (saved.absorbed && typeof saved.absorbed === 'object') this.store.absorbed = saved.absorbed;
+          // ★ 2026-10-28（阶段 C）：观测流跟着判断库一起回来。
+          //   丢了它，内核就数不出「见过几回」，归纳能力等于每次重启归零。
+          if (Array.isArray(saved.events) && saved.events.length) {
+            this.store.events = saved.events.map(eventFromJson);
+            this.store.eventSeq = this.store.events.reduce((m, e) => Math.max(m, Number(e.seq) || 0), 0);
+          }
           // ★ seed 要接着上次的往下数。归零会让 curiosity 的冷却判据
           //   `seed - lastFired <= cooldownBeats` 恒成立（负数永远小于正数），
           //   **她重启之后就再也不会追问同一个悬案**，而且不报错、看不出来。
@@ -359,6 +368,17 @@ export class Mind {
         linked.weight = Math.min(1, (linked.weight ?? 0) + WEIGHT_REINFORCE);
         linked.updatedAt = this.now();
         linked.fuseCount = (linked.fuseCount ?? 0) + 1;
+        // ★ 2026-10-28：底气重算。weight 只是模型的 hint，strength 才是决策用的那个数。
+        //   重讲一遍不改结论，但它确实又多了一条凭据——那份变化进 strength，不进 weight。
+        linked.strength = strengthOfBelief(linked, this.now());
+        // ★ 2026-10-28（阶段 C）：这一次「又看见同一件事」也要入账。
+        //   它不新建判断，但它是归纳的粮食——少记这一笔，内核就永远数不够 3 回。
+        this.store.observe(makeEvent({
+          at: this.now(),
+          actor: linked.subject, action: linked.relation, polarity: linked.polarity,
+          text: linked.text, themeKey: linked.themeKey, source: 'synth',
+          weight: linked.weight, beliefId: linked.id,
+        }));
         // ★ 2026-10-27 大乔裁决后删掉这里的一行：
         //     if (linked.status === STATUS.PENDING) transition(linked, STATUS.HELD);
         //   原来「同一句再说一遍」就直接把它定成 held。
@@ -497,6 +517,8 @@ export class Mind {
       };
       const turn = recordTurn(current, next, { at: this.now(), via: 'synth' });
       if (stageMoved) current.stage = created.stage;
+      // ★ 2026-10-28：记完这一笔就重算底气。她有多在意，从此是算出来的。
+      current.strength = strengthOfBelief(current, this.now());
       judgment = { ...toNote(current), changed: turn.changed, change: turn.change };
     } else {
       // 新建，或者旧结论刚被自己推翻——都另起一条现役的。
@@ -657,6 +679,10 @@ export class Mind {
     const bornStage = ['understood', 'settled', 'acting'].includes(String(created.stage ?? ''));
     if (!bornStage) setTension(b, { since: this.now(), why: '才碰上一条，不下结论' });
     else transition(b, STATUS.HELD, { at: this.now() });
+    // ★ 2026-10-28：刚出生就按证据算一次底气。
+    //   一条证据 → 约 0.35（跟原来 Belief 的默认 0.30 接近，不会让她整个人变重）。
+    //   模型给的 weight 留在 b.weight 里，只作审计用。
+    b.strength = strengthOfBelief(b, this.now());
     return b;
   }
 
@@ -668,7 +694,103 @@ export class Mind {
 
   snapshot() {
     const s = this.flash.snapshot();
-    return { ...s, seed: this.seed, heat: this.forge.pending };
+    return { ...s, seed: this.seed, heat: this.forge.pending, events: this.store.events.length };
+  }
+
+  /**
+   * ★ 2026-10-28（阶段 C）：内核自己归纳。
+   *
+   * 不调模型。只有计数和除法。
+   * 返回的 `claims` 是「我自己数出来的判断」，`pendings` 是「数得出来见过几回、
+   * 但数不出一个方向」的真悬案——跟「模型说它还拿不准」不是一回事。
+   */
+  induct(opts = {}) {
+    return induce(this.store.events, { now: this.now(), ...opts });
+  }
+
+  /**
+   * 归纳结果跟库里现有判断对账。
+   *
+   * `novel` 那一条最要紧：那是**内核数出来了、模型从没给过**的判断。
+   * 它能存在，才说明判断权真的不在模型手里。
+   */
+  reconcileInduction(opts = {}) {
+    const i = this.induct(opts);
+    return { induct: i, ...reconcile(i, this.notes()) };
+  }
+
+  /**
+   * ★ 2026-10-28（阶段 C·D）：把内核数出来的一条判断，收进库。
+   *
+   * 这是「内核独立发现」真正落地的那一步：
+   * `novel` 的候选原来只活在报表里，落不了库，也就影响不了她。
+   * 收进来之后，它会跟别的判断一样参与 fade / wake / motive ——
+   * **她自己数出来的东西，真的能改变她自己。**
+   *
+   * 三条纪律：
+   *   1. 同 themeKey 已有现役判断 → 不收（不重复占格子）
+   *   2. 方向跟现役相反 → 记冲突，不覆盖（她可以同时记着「两种看法」）
+   *   3. 一句话必须由调用方给（表达归模型，计数归内核，两边都碰不到对方的活）
+   *
+   * @param {object} p { actor, action, polarity, text, why, support, consistency, lastAt }
+   * @returns {{adopted:boolean, id?:string, reason:string}}
+   */
+  adoptClaim({ actor, action, polarity, text, why = '', support = 0, consistency = 0.5, lastAt = 0 } = {}) {
+    const a = String(actor ?? '').trim();
+    const act = String(action ?? '').trim();
+    const t = String(text ?? '').trim();
+    if (!a || !act || !t) return { adopted: false, reason: 'incomplete' };
+    if (Number(support) < 3) return { adopted: false, reason: 'thin' };
+
+    const themeKey = `${act}|${a}`;
+    const now = this.now();
+
+    // ① 同主题已有现役判断：不收，但方向相反要留痕
+    const existing = this.store.active(themeKey);
+    if (existing) {
+      if (Number(existing.polarity) !== Number(polarity)) {
+        existing.tension = {
+          ...(existing.tension ?? { since: now }),
+          kind: 'conflict',
+          counterView: t,
+          counterSupport: Number(support),
+          counterConsistency: Number(consistency),
+          because: `我自己数了 ${support} 回，${Math.round(Number(consistency) * 100)}% 是 ${Number(polarity) > 0 ? '正' : '负'}的`,
+          lastAt: now,
+        };
+        return { adopted: false, reason: 'conflict-recorded', id: existing.id };
+      }
+      return { adopted: false, reason: 'already-held', id: existing.id };
+    }
+
+    // ② 新建。origin 标 induction：这条不是谁告诉她的，是她自己数出来的。
+    const b = new Belief({
+      themeKey,
+      subject: a,
+      relation: act,
+      polarity: Number(polarity) > 0 ? 1 : -1,
+      text: t,
+      why: String(why || '我自己数出来的').slice(0, 120),
+      weight: 0.5,
+      at: now,
+      via: 'induction',
+    });
+    b.origin = 'induction';
+    // 底气直接按证据算，不走 turns（它没有「某一次经历」，只有一份统计）
+    b.strength = strengthFromEvidence({
+      support: Number(support),
+      consistency: Number(consistency),
+      lastAt: Number(lastAt) || now,
+      now,
+    });
+    // 证据够、方向一致的，直接落定；不够一致的留成悬案（跟 observe 那条路同口径）
+    if (Number(consistency) >= 0.7) transition(b, STATUS.HELD, { at: now });
+    else setTension(b, { since: now, why: `数了 ${support} 回，方向还没统一` });
+    this.store.add(b);
+    // ★ 收进来的当场落盘：这条跟「熔出一锅」一样是永久记忆，
+    //   不落盘的话，下次重启她又把自己数出来的东西忘了。
+    this.persist();
+    return { adopted: true, id: b.id, reason: 'new' };
   }
 
   recall(query) {
@@ -742,6 +864,15 @@ export class Store {
     this.max = max;
     this.list = [];
     this.absorbed = {};
+    /**
+     * ★ 2026-10-28（阶段 C）：观测流。
+     *
+     * 一条判断入库 = 一次观测入账。内核从这里数「同一个人同一个动作见过几回」，
+     * 数得够多、方向够一致，它自己就能得出判断——不需要谁告诉它。
+     * 这就是「判断权归内核」的落点。
+     */
+    this.events = [];
+    this.eventSeq = 0;
   }
 
   get all() {
@@ -754,7 +885,35 @@ export class Store {
 
   add(b) {
     this.list.push(b);
+    // 入库即入账：把这条判断拆成 (谁 / 做了什么 / 哪个方向) 记一笔。
+    // source 从 turns 的 via 推：synth = 逐条熔，digest = 归档熔。
+    const via = Array.isArray(b?.turns) && b.turns.length
+      ? String(b.turns[b.turns.length - 1]?.via ?? '')
+      : '';
+    const source = via === 'synth' || via === 'digest' ? via : 'digest';
+    this.observe(eventFromBelief(b, { seq: 0, source }));
     return b;
+  }
+
+  /**
+   * 记一次观测。
+   *
+   * ★ 2026-10-28（阶段 C）：这是归纳的粮食。
+   *
+   * 光靠 `add()`（只在**新建判断**时调）记不够：
+   * 同一件事第二次、第三次熔出来时走的是 `recordTurn`（加固旧判断，不新建），
+   * 那几次观测就丢了。实测：38 条判断只对应 38 条观测，
+   * 按 (对象, 动作) 一分组每组就 1 条，`minSupport=3` 永远达不到 ——
+   * **内核数不出任何东西，归纳能力等于没装。**
+   *
+   * 所以：每一次「熔出一个结论」都要入账，不管它有没有新建判断。
+   */
+  observe(e) {
+    if (!e) return null;
+    this.eventSeq += 1;
+    const ev = { ...e, seq: this.eventSeq };
+    this.events.push(ev);
+    return ev;
   }
 
   active(themeKey) {

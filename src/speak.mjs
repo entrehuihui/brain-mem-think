@@ -241,7 +241,13 @@ export async function askSpeak({ synth, world = '', name = '', state = {}, now =
   });
   let raw = null;
   try {
-    raw = await synth.ask(SPEAK_SYSTEM, material, { maxTokens: Number(cfg.speakMaxTokens ?? 600) });
+    // ★ 2026-10-28 修（重启后实测，这条比看起来重要）：
+    //   600 对 reasoning 模型根本不够。`deepseek-flash` 会先把几千字内心推演跑完
+    //   才吐正文，600 的预算全烧在 reasoning 上 → `text-delta` 一个都没有。
+    //   日志原样：`synth-reply len:0, reasoned:0, chunks:{"finish":1}`。
+    //   后果是她每回都 `not_object`，一句话也说不出来——不是她不想说，是话被预算掐死了。
+    //   历史成功的调用全是 4000 预算的归档熔，这就是证据。
+    raw = await synth.ask(SPEAK_SYSTEM, material, { maxTokens: Number(cfg.speakMaxTokens ?? 2000) });
   } catch (err) {
     return { ok: false, action: 'silent', say: '', because: '', why: `throw:${err?.message ?? err}` };
   }

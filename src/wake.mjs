@@ -119,14 +119,19 @@ export function hashLedger(notes) {
  */
 export const hashSay = hashSayText;
 
+/** 一条判断在她心里的份量：strength（证据算出来的）优先，老数据回退 weight。 */
+function magnitude(n) {
+  return Number(n?.strength ?? n?.weight) || 0;
+}
+
 /** 心事有多重：压着的判断越多越重，悬着的更重（想不明白才惦记）。 */
 export function burdenOf(notes) {
   const live = (notes ?? []).filter(isLive);
   if (!live.length) return { burden: 0, heaviest: null, open: 0 };
   const open = live.filter(isOpen);
-  const heaviest = [...live].sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))[0];
+  const heaviest = [...live].sort((a, b) => magnitude(b) - magnitude(a))[0];
   // 重 = 最重那条的份量 + 悬案带来的挂心
-  const burden = Math.max(0, Math.min(1, (heaviest?.weight ?? 0) * 0.8 + open.length * 0.12));
+  const burden = Math.max(0, Math.min(1, magnitude(heaviest) * 0.8 + open.length * 0.12));
   return { burden: Number(burden.toFixed(3)), heaviest, open: open.length };
 }
 

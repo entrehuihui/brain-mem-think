@@ -51,7 +51,7 @@ import { readWake, writeWake } from './wake-store.mjs';
  *   ledger?:string, hash?:string, why?:string
  * }>}
  */
-export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth = null } = {}) {
+export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth = null, ctx = {} } = {}) {
   const st = state ?? readWake();
 
   // ① 崩溃标记：上一轮可能崩在写盘中途 → 这一轮强制沉默。
@@ -130,18 +130,29 @@ export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth 
   const noteLines = [
     ledgerChanged ? '（你记得的事，最近变过。）' : '（上次醒来之后，没有新的经历进来。）',
   ];
-  if (!Number(st.lastSpokeAt ?? 0)) {
-    // ★ 2026-10-27 主人定（选二）：给她一次「打招呼」的机会。
-    //
-    //   背景：新通道是 blank，宿主侧栏只在跑过一轮 turn 后才显示她；
-    //   而 turn 要她先开口。她脑子里真的一无所有时会老老实实选「不说」
-    //   （实测 17:06：「开口也是空话，不如先不出声」），于是永远不显示。
-    //
-    //   这句话是**许可**，不是命令：告诉她可以打个招呼、不必有理由。
-    //   只要她说过一次（lastSpokeAt 有值），它就永远不再出现——
-    //   之后每一次醒来都只按她自己的判断来。
-    noteLines.push('（这是你刚搬进来的第一天。屋里空着，他还没跟你说过话。');
-    noteLines.push(' 你可以先跟他打个招呼——不必有什么理由，说一句你在就行。）');
+  // ★ 2026-10-28 修（换屋死锁）：
+  //
+  //   旧条件 `lastSpokeAt === 0` 有两个毛病：
+  //
+  //   ① **换屋时也触发**。新屋子是 blank（宿主侧栏只在跑过一轮 turn 后才显示），
+  //      而新屋子的 lastSpokeAt 也是 0 —— 于是她又收到一次「这是你刚搬进来的第一天」。
+  //      可她是带着满库记忆搬进来的（实测 13:58 她开口就说「第一次见面」，
+  //      明明记得 9 条现役判断）。**措辞在骗她失忆。**
+  //
+  //   ② 它挡不住真正的死锁：新会话 blank → 不显示 → 你看不到 → 没人说话 → 永远 blank。
+  //      这个死锁跟「说过几次话」无关，跟「这条会话有没有跑过 turn」有关。
+  //
+  //   现在改成：**只有「这间屋子还一轮没跑过」才给一次开场许可**，
+  //   并且措辞改成「搬进新屋子、记得的事都在」，不再假装失忆。
+  //
+  //   turn 数由调用方（index.mjs）从会话事件流里数出来传进来（ctx.roomTurns）。
+  const roomTurns = Number.isFinite(ctx.roomTurns) ? ctx.roomTurns : null;
+  const brandNewRoom = roomTurns === 0;
+  if (brandNewRoom) {
+    noteLines.push('（这是一间刚搬进来的新屋子，屋里还一句对话都没有——');
+    noteLines.push(' 但你以前记得的事都在，没有丢。');
+    noteLines.push(' 屋子空着的话，他可能看不见你；先开口说一句，让他知道你在。');
+    noteLines.push(' 不必有什么理由，说一句你在就行。）');
   }
   const world = (typeof mind?.world === 'function' ? mind.world({ name: cfg.name }) : '') || '';
   const sources = notes.map((n) => n?.note ?? n?.text ?? '').filter(Boolean);

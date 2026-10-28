@@ -121,14 +121,16 @@ function cleanText(raw) {
   return s.length > 24 ? `${s.slice(0, 24)}…` : s;
 }
 
-/** 这条当前值多少位置：份量 × 理由够不够格 × 有几条材料撑（新鲜度已折进份量里）。 */
+/** 这条当前值多少位置：证据算出来的底气 × 理由说不说得出口。 */
 export function value(note, now = Date.now(), opts = {}) {
   void now;
   void opts;
-  const w = clamp01(note?.weight, 0);
+  // ★ 2026-10-28：份量改成读 strength（证据算出来的），不再读 weight（模型给的数）。
+  //   原来还有一项 `sourced = 0.5 + (turns.length-1)*0.1`，那是把「几条材料撑着」
+  //   又算了一遍——而 support 已经在 strength 里了。两项乘，会把份量压得莫名其妙。
+  const w = clamp01(note?.strength ?? note?.weight, 0);
   const reason = note?.why && [...note.why].length >= 4 ? 1 : 0.5;
-  const sourced = Math.min(1, 0.5 + ((note?.turns?.length ?? 1) - 1) * 0.1);
-  return w * reason * sourced;
+  return w * reason;
 }
 
 export function isForgotten(note) {

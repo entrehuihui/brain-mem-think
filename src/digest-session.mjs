@@ -14,8 +14,10 @@
  * 原文不进库：消息只在这一次拼成材料，交出去、用完即弃；落库的只有模型熔出来的判断。
  */
 
-import { Belief, PREDICATES, STATUS, clean, normalizeRelation, recordTurn, similarity, transition } from './judge.mjs';
-import { canonicalRelation, longestSharedRun, COPY_RUN_LIMIT, looksClinical } from './forge.mjs';
+import { Belief, PREDICATES, STATUS, clean, normalizeRelation, recordTurn, setTension, similarity, transition } from './judge.mjs';
+import { canonicalRelation, longestSharedRun, COPY_RUN_LIMIT, looksClinical, mainPathHolds, stabilityOf } from './forge.mjs';
+import { strengthOfBelief } from './strength.mjs';
+import { makeEvent } from './event.mjs';
 
 export const DIGEST_DEFAULTS = Object.freeze({
   maxCharsPerMessage: 600,
@@ -136,6 +138,22 @@ function normalizeOne(raw, material, opts) {
   if (!st.ok) return null;
   const subject = clean(raw.subject ?? '他', 8).replace(/[「」『』"'“”，。！？；：、\s]/g, '') || '他';
   const weight = Math.max(0, Math.min(1, Number(raw.weight ?? 0.5)));
+  // ★ 2026-10-28 修（P0-2 · 编造在这条路上长驱直入）。
+  //
+  //   这条路原来**没有 grounding 这一问**，只查「抄没抄原文」。
+  //   于是模型可以从「今天中午吃了碗面，下午看了会儿书」里编出
+  //   「他一直熬到后半夜才肯跟我说真话」——不抄原文就能入库。
+  //   实测（2026-10-28）：材料 44 字，零关系判断，reason: digested，直接进库。
+  //
+  //   现在和逐条 ingest 用同一把尺：稳定性低于阈值、且主路（谓词 + 对象 +
+  //   不许编具体时点 + 至少一条线索落在材料上）也不成立 → 不收。
+  //   宁可少记一条，不记一条编的。
+  const skeletons = [material.replace(/[^\u3400-\u9fffA-Za-z0-9]/g, '')];
+  const stab = stabilityOf(text, [material]);
+  const mainOk = mainPathHolds(text, skeletons, { relation: st.relation, subject, weight, why: raw.why });
+  if (stab < 0.12 && !mainOk) {
+    return null;
+  }
   return {
     text,
     why: clean(raw.why ?? '', 120) || '说不上来，就是觉得',
@@ -200,6 +218,37 @@ export async function digestSession(messages, ctx = {}) {
 }
 
 /**
+ * 一条判断落库时，该是「悬着」还是「定下来」。
+ *
+ * ★ 2026-10-28 修（回放真实数据时抓到的）：
+ *   原来这里**无条件** `transition(b, HELD)`——模型明明在 stage 里写了
+ *   `pending`（「我还下不了结论」），落库却一律变成 held。
+ *   实测拿 6 个真实会话回放，熔出 3 条 stage=pending 的判断，**3 条全被摁成 held**。
+ *
+ *   后果是连锁的：
+ *     · `curiosity` 只认 `status === 'pending'` → 悬案永远是 0 → 不会追问
+ *     · `motive` 的 `resolve` 只看 open → 她永远没有「想自己去弄明白」的念头
+ *     · `world` 的「还没想明白」那一栏永远是空的
+ *
+ *   这跟 `mind.#birth` 用的是同一条规矩：**落定只认她自己说的 stage**。
+ */
+function bornStatus(stage) {
+  return ['understood', 'settled', 'acting'].includes(String(stage ?? '').toLowerCase())
+    ? STATUS.HELD
+    : STATUS.PENDING;
+}
+
+/** 落库：按 stage 决定悬着还是定下来；悬着的要留 tension，否则渲染不出「为什么悬」。 */
+function land(b, stage, now) {
+  const to = bornStatus(stage);
+  if (to === STATUS.PENDING) {
+    setTension(b, { since: now, why: '这一段里还没想明白' });
+    return;
+  }
+  transition(b, to, { at: now });
+}
+
+/**
  * 一段会话熔完之后，把结果并进记忆库。
  * 直接落判断，不再经过火炉——这一段已经是「想完了的结论」，不该被二次重熔。
  * 落库用的仍是 judge.Belief，生命周期和别的判断一模一样。
@@ -239,10 +288,26 @@ export async function commitDigest(mind, result, { at } = {}) {
   //
   //   （想恢复「单条强证据可翻」，就把 `memo: null` 改回去——
   //    但那次改动之前，请先想清楚为什么 8 条记忆在一天之内全被翻掉。）
+  // 主题键归一：'trusts|他' 和 'Trusts|他 ' 是同一摊事，'trusts|他' 和 'stalls|他' 不是。
+  const normKey = (k) => String(k ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
   for (const j of result.judgments) {
     const themeKey = `${j.relation}|${j.subject}`;
-    // 同一摊事按「说的对象」找：谓词可能因为改主意而变，但对象不会。
-    const current = mind.store.all.find((b) => b.subject === j.subject && b.alive) ?? mind.store.active(themeKey);
+    // ★ 2026-10-28 修（P0-1 · 会吃掉整库的那个）。
+    //
+    //   原来这里是 `find(b => b.subject === j.subject && b.alive)` ——
+    //   按「说的对象」找现役判断，理由是「谓词可能因为改主意而变，但对象不会」。
+    //
+    //   可 subject 归一后绝大多数就是「他」/「我」。于是：
+    //     · 「他拖着不办事」会被「他催我」当场改写
+    //     · 一次归档熔出 4 条不同判断，全部并进同一条，库里**一条都不增**
+    //   实测（2026-10-28）：4 条 judgments，回执 ids 是同一个 id 重复四次。
+    //
+    //   改法：只有主题键（relation|subject）对得上，才算「同一摊事」。
+    //   同一对象、不同谓词，是两件事——各占一格，谁留下由 fade 按份量决定。
+    //   这不会让库无限涨：现役上限仍在 fade 手里。
+    const current = mind.store.active(themeKey)
+      ?? mind.store.all.find((b) => b.alive && normKey(b.themeKey) === normKey(themeKey))
+      ?? null;
 
     if (current) {
       // 这一摊事已经有现役判断：走「会想多」——和逐条 ingest 用的是同一套。
@@ -271,9 +336,10 @@ export async function commitDigest(mind, result, { at } = {}) {
           at: now,
           via: 'digest',
         });
-        transition(b, STATUS.HELD, { at: now });
+        land(b, j.stage, now);
         mind.store.add(b);
         current.nowNote = b.text;
+        b.strength = strengthOfBelief(b, now);   // ★ 2026-10-28：底气由证据算，不由模型给
         ids.push(b.id);
         updated += 1;
       } else {
@@ -285,7 +351,18 @@ export async function commitDigest(mind, result, { at } = {}) {
         }, { at: now, via: 'digest' });
         // 谓词/立场真变了：主题键跟着换，免得同一个对象占着两个槽
         if (j.relation !== current.relation || j.polarity !== current.polarity) current.themeKey = themeKey;
-        if (current.status === STATUS.PENDING) transition(current, STATUS.HELD, { at: now });
+        current.strength = strengthOfBelief(current, now);   // ★ 2026-10-28：记完这笔就重算底气
+        // ★ 2026-10-28（阶段 C）：这一次「又看见同一件事」也要入账。
+        //   走 recordTurn 不新建判断，但它是归纳的粮食——
+        //   少记这一笔，内核按 (对象, 动作) 分组每组只有 1 条，永远数不出「见过 3 回」。
+        mind.store.observe(makeEvent({
+          at: now,
+          actor: j.subject, action: j.relation, polarity: j.polarity,
+          text: j.text, themeKey, source: 'digest', weight: j.weight, beliefId: current.id,
+        }));
+        if (current.status === STATUS.PENDING && bornStatus(j.stage) === STATUS.HELD) {
+          transition(current, STATUS.HELD, { at: now });
+        }
         ids.push(current.id);
         updated += 1;
       }
@@ -306,8 +383,9 @@ export async function commitDigest(mind, result, { at } = {}) {
       at: now,
       via: 'digest',
     });
-    transition(b, STATUS.HELD, { at: now });
+    land(b, j.stage, now);
     mind.store.add(b);
+    b.strength = strengthOfBelief(b, now);   // ★ 2026-10-28：底气由证据算，不由模型给
     ids.push(b.id);
   }
   return { stored: ids.length, updated, retired, committed: true, ids };

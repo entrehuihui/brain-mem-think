@@ -1,0 +1,289 @@
+# 2026-10-28 改动清单（给接手的人）
+
+> 这份文档是**交接用**的。按「改了什么 → 为什么 → 验证到哪一步 → 还有什么没做完」排列。
+>
+> 分支：`main`　提交范围：`6e8655c` 之后
+
+---
+
+## 一、总览
+
+一句话：**把「判断权」从模型手里拿回来，让它从记忆自己数出来；再把「主动性」这条路接上，让她能自己出去做事。**
+
+改动规模：26 个文件，约 +2400 行。新增 11 个模块。
+
+---
+
+## 二、五个 P0（数据完整性，必须先看这些）
+
+| # | 文件 | 原来是什么病 | 现在 |
+|---|---|---|---|
+| A1 | `src/digest-session.mjs` | `find(b => b.subject === j.subject && b.alive)` —— 按**对象**找现役判断，而对象归一后几乎都是「他」。**一次归档熔 4 条判断能全并进同一条，库里一条都不增** | 只认 `themeKey`（relation\|subject）精确匹配 |
+| A2 | `src/digest-session.mjs` `normalizeOne` | 这条路**没有 grounding 那一问**，模型能从「今天吃了碗面」里编出「他熬到后半夜」 | 补上 `stabilityOf` + `mainPathHolds` |
+| A3 | `src/forge.mjs` `mainPathHolds` | 两处无条件放行：第④问「长度≥6 → true」、HABIT 分支「以 subject 开头 + 有恒常词 → true」 | 两处都要求**理由贴着材料**（共享≥1 个二字实词） |
+| A4 | `src/forge.mjs` `stabilityOf` | 「可识别率」算的是 `去重字数/总字数`，恒 ≈1，这一维从没生效 | 拆成 `ground` + `repetition` 惩罚 |
+| A5 | `src/persist.mjs` `fingerPrint` | 手挑 7 个字段算指纹，落盘却是 30+ 字段。只改 `lastFired/why/turns/tension/...` 时指纹不变 → `save()` 跳过 → **修改永远丢** | 指纹直接哈希 `beliefToJson` 全量 |
+
+### 复现数据（改前 → 改后）
+
+```
+4 条归档判断 → 库 1 条（全并进一条）   →  库 5 条（各自成条）
+编造判断「他熬到后半夜」（材料「今天中午吃碗面」）→ 入库  →  被拦
+只改 lastFired/why/turns/tension/settledFrom/asked → 六项全不落盘  →  六项全落盘
+```
+
+---
+
+## 三、新增：底气可算（`src/strength.mjs`）
+
+`weight`（模型给的）与 `strength`（证据算的）**分开存**，所有决策只认 `strength`。
+
+```
+support 0.45（见过几回，5 条撑满）
+consistency 0.30（同方向占比；只 1 条时算"不知道"=0.5）
+variety 0.10（来源数）
+recency 0.15（30 天半衰）
+× 反例惩罚 1/(1+反例×0.6)
+```
+
+校准点：
+
+| 证据 | strength |
+|---|---|
+| 1 条 | 0.35（对齐原来默认 0.30） |
+| 3 条一致 | 0.725 |
+| 5 条一致 | 0.95 |
+| 5 条 3正2反 | 0.377 |
+
+接入点：`mind.#birth`、`mind.#burn`、`commitDigest`。读取点：`fade.value`、`wake.burdenOf`、`world.moodOf`、`flash.toNote`。
+
+`explainStrength()` 能回答「她为什么这么想」。
+
+---
+
+## 四、新增：内核自己归纳（阶段 C）
+
+| 文件 | 作用 |
+|---|---|
+| `src/event.mjs` | 观测结构 `{actor, action, polarity, text, themeKey, source, beliefId}` |
+| `src/induct.mjs` | 纯统计归纳 + 四分类对账 |
+
+**关键纪律**：每一次熔出一个结论就记一条观测（不管有没有新建判断）。
+只记新建判断的话，38 条判断只对应 38 条观测，按 `(对象,动作)` 分组每组 1 条，`minSupport=3` 永远达不到——**归纳能力等于没装**。
+
+`reconcile()` 四分类：`confirmed`（一致）/ `contested`（冲突）/ `novel`（内核独立发现）/ `thin`（证据不足）。
+
+### 真数据结果（42 条判断 → 85 条观测）
+
+```
+✓ 我/checks_first  support=11  一致率=1.000
+✓ 他/wants         support=8   一致率=1.000  「他要的是一个会自己起念头的记忆」
+✓ 他/checks_first  support=7   一致率=0.857
+✓ 我/learns_from   support=6   一致率=0.833
+✓ 我/stalls        support=4   一致率=0.750
+冲突 2 条
+```
+
+**已知限制**：`novel` 恒为 0，因为 event 只有「从判断倒推」一个来源。要让它出东西，event 必须有判断之外的来源（她自己的行为 / 工具结果）。
+
+---
+
+## 五、新增：第一手观测 + 表达（阶段 D）
+
+### 断点
+
+`plugin/collect.mjs:92` 的白名单只认 `user/human/owner`，**工具结果一条都进不了熔的材料**。她看得见（有工具、有识图），但看见的不入账。
+
+### 接法
+
+| 文件 | 作用 |
+|---|---|
+| `src/observe.mjs` | `tool/call` + `tool/result` → `(我, 工具, 成/败)` |
+| `plugin/tool-observer.mjs` | 每跳增量读（`tool-cursor.json` 记账） |
+| `src/express.mjs` | 把数字说成一句话——**模型只能说，不许改数字** |
+
+`Mind.adoptClaim()` 收进库，之后参与 fade/wake/motive。
+
+### 真数据结果（12 个会话 → 2237 次工具调用 → 30 条失败）
+
+```
+held 0.95  edit|我        「我做事总太急，没细看就上手，难怪改不成。」
+held 0.95  read_image|我  「我看图总弄不成，才发觉自己手太急，没看仔细。」
+held 0.72  bash|我        「我跑命令老是不成，才看见自己手太急，没弄明白就上手。」
+```
+
+### 表达层护栏
+
+`parseExpressed()` 丢掉：带数字/「统计」「数据」等词、长度不在 4~48、说不出就 NULL。
+**宁可让判断停在数字状态，不要一句编的。**
+
+---
+
+## 六、新增：主动性（阶段 F）
+
+| 文件 | 作用 |
+|---|---|
+| `src/motive.mjs` | 冲动生成（四种来源，每条必须带 `why` 且出自记忆） |
+| `src/preference.mjs` | 偏好学习（收获型 vs 满足型两把尺） |
+| `src/budget.mjs` | 五道闸 |
+| `plugin/motive-store.mjs` | 偏好与预算的账 |
+
+tick 从「说/不说」变成「说 / 做 / 歇着」。
+
+### 五道闸
+
+驱动 ≥0.5 / 一天 ≤3 趟 / 间隔 ≥40 分钟 / **主人安静 ≥10 分钟** / 收获型回来要有产出。
+
+### 轮转（三次迭代才调对）
+
+| 迭代 | 问题 | 数据 |
+|---|---|---|
+| 初版 | 任一条悬案霸榜 | 7 次出去，**7 次全是同一件** |
+| 第一修 | 按本地零点划界，跨零点失效 | 7 次 → 3 件 |
+| 第二修 | 12 小时滑动窗 + 7 天内去过 n 次降权 | 4 件 / 7 次，**每天之内不重复** |
+
+### practice 话术（两次迭代）
+
+初版 `把cannot_say练熟` —— **不可执行**，她 turn 跑完、一句话没说、一个工具没调。
+改成「想清楚『X』为什么老办砸 → 回来记一条我定的规矩」。
+
+---
+
+## 七、运行时的几个坑（都是生产实测踩出来的）
+
+### 7.1 tick 链断掉
+
+```js
+void tick().finally(schedule);   // tick() 有一个 await 永不 resolve → 链静默死掉
+```
+
+修法：
+- `next()` 里加 `inFlight` 并发闸，跳过这一拍但**照样排下一次**
+- 硬超时 2 分钟，**绝不 unref**（它就是保命的）
+- `pokeWake` 走 `next()`，不直接调 `tick()`
+- 每跳 `tick-alive {n}` 心跳
+
+### 7.2 模型流挂死
+
+`for await` 卡在「等下一个 chunk」时，循环内判断超时救不出来（**实测过**）。
+
+修法：把消费过程塞进 Promise，和「到点 reject 的定时器」赛跑：
+
+```js
+await Promise.race([consume(), wall]);
+```
+
+### 7.3 遮蔽撕裂 tool 配对
+
+```
+[call] [call] │ [result] [result]
+ 遮     遮        留        留     ← 网关 400，会话报废
+```
+
+修法：切完再检查，配对两半落在切痕两侧的，**整对往「留下」那侧挪**。
+
+### 7.4 配额双计
+
+`wake-exit` 和 `applyWake` 各 push 一条 speak → `maxSpeakInWindow=2` 一次就满。
+修法：只留 `applyWake` 记账。
+
+### 7.5 token 预算
+
+reasoning 模型 600 token 全烧在思考上，正文一个字不出（`len:0`）。
+`speakMaxTokens: 600 → 2000`，表达调用 `240 → 1500`，`synthTimeoutMs: 45s → 90s`。
+
+### 7.6 换屋死锁
+
+新会话 blank → 侧栏不显示 → 找不到 → 没人说话 → 永远 blank。
+修法：`roomTurns === 0` 时给一次开场许可，措辞改成「搬进新屋子，记得的事都在」；建好 3 秒后 `pokeWake()`。
+
+---
+
+## 八、**没做完的（接手重点）**
+
+### 8.1 熔和遮蔽的时序 ⚠️ 最重要
+
+主人的原设计：
+
+```
+记忆₀ + 你说的第 1 句 → 模型 → 记忆₁
+```
+
+**要的是「回完话立刻熔、立刻遮蔽」，不等 tick。**
+
+现状：
+
+| 项 | 状态 |
+|---|---|
+| `turn/end` 钩子挂上 | ✅ `turn-hook-armed` |
+| 钩子触发 | ✅ `turn-end-hook` |
+| 立刻遮蔽 | ✅ `compact-ok` |
+| **立刻熔** | ❌ **从未成功** |
+
+原因：`turn/end` 那一刻 `agent.status` 还是 `running`，而 `digestChannelIncrement` 入口有 idle 闸，把自己挡死：
+
+```
+channel-digest-skip  why:"agent-busy" status:"running"
+```
+
+**已修**（`fromTurnEnd: true` 跳过 idle 闸），**但还没重启验证**。
+
+重启后应看到：
+
+```
+turn-end-hook
+channel-digest-from-turn-end {"skipIdleGate":true}
+channel-digest-start  fresh:1
+channel-digest-done   judgments:N
+compact-ok
+```
+
+**四行齐了才算成。**
+
+### 8.2 其他
+
+| 项 | 状态 |
+|---|---|
+| 记忆闸（`j` 那条红） | 未做。`wake()` 收了 `lastLedgerHash` 但 `gate()` 从没读过 → 账本不动照样开口 100/100 |
+| 时序验证（`k` 那条红） | 未做，缺宿主 adapter |
+| `novel` 恒为 0 | event 需要判断之外的来源才能出结果 |
+| 偏好真实情绪源 | 现在只按「有没有产出」判涨跌 |
+| `revision.mjs` 的 `fresh != null` 捷径 | 还开着（`reconsider` 这条路），`commitDigest` 已绕开 |
+
+---
+
+## 九、测试
+
+```
+node tools/verify.mjs         8 绿（含用真实记忆的渲染检查）
+node tests/smoke_induct.mjs   14 绿
+node acceptance/run_all.mjs   25 绿 / 2 红（j 记忆闸、k 宿主 adapter）
+```
+
+两条红是**已知未完成**，不是回归。
+
+### 复现脚本
+
+`replay/replay.mjs` —— 拿 `~/.dsh/sessions` 的真实会话回放：
+
+```
+node replay.mjs 2 54          熔 + 模拟
+node replay.mjs 2 54 reuse    跳过熔，只跑模拟
+```
+
+注意：会话是**多帧 zstd**，`zstdDecompressSync` 一次只能解第一帧，需要按 magic `28 B5 2F FD` 逐帧解。
+
+---
+
+## 十、排查手册（这次踩过的）
+
+| 现象 | 先看哪 |
+|---|---|
+| 她不动 | `mind.log` 最后修改时间 vs 现在；`tick-alive` 有没有在涨 |
+| 熔了没 | `channel-digest-skip` 的 `why` |
+| 话发不出 | `wake-speak sent:false` 的 `why` |
+| 模型空回复 | `synth-reply len:0`，看 `chunks` 里有没有 `text-delta` |
+| 会话 400 | 查 `tool/call` 和 `tool/result` 的 `callId` 是否成对 |
+| 记忆没长 | `digest-owners` 的 `owners` / `chars` |
+
+**PS 5.1 的坑**：`Get-Content` 按 GBK 读 UTF-8 文件会把中文变乱码，`ConvertTo-Json` 可能写出空文件。**改带中文的 JSON 一律用 node。**
