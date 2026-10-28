@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.episode.2';
+const BUILD = '2026-10-28.episode.6';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -633,7 +633,17 @@ export function apply(ctx, config = {}) {
    *   拿不到就每 2 秒再试，最多 60 次（两分钟），全程不抛。
    */
   const startWakeLoop = (agentsSvc) => {
-    if (!cfg.wake || !agentsSvc) return;
+    // ★ 2026-10-28 修（结构性）：「回完话立刻熔」被埋在「她会自己醒」里面。
+    //
+    //   这里原来是 `if (!cfg.wake || !agentsSvc) return;`——
+    //   于是 cfg.wake=false（关掉自己醒，比如主人睡觉时段）时，**整个函数体不执行**：
+    //   digestChannelIncrement / compactChannel / armTurnHook / tick 全都不定义。
+    //   后果：turn/end 钩子挂不上（armTurnHook 还是那个空实现），
+    //   「每轮熔 + 熔完就遮」静默消失，只剩一条什么都没做的 tick 链。
+    //
+    //   熔和醒是两件事：醒是她自己想不想开口，熔是「这一轮发生过什么」的记账。
+    //   关掉醒不该把账本一起关掉。现在只挡「没有 agents 服务」，tick 自己看 cfg.wake。
+    if (!agentsSvc) { trace('wake-loop-skip', { why: 'no-agents' }); return; }
     if (wakeLoopStarted) return;
     wakeLoopStarted = true;
     let timer = null;
@@ -1035,8 +1045,24 @@ export function apply(ctx, config = {}) {
           trace('turn-hook-skip', { why: 'ctx-on-unavailable' });
           return;
         }
-        if (ctx[TURN_HOOK] === true) { trace('turn-hook-already', {}); return; }
-        ctx.on('session/event', async (s, event) => {
+        // ★ 2026-10-28 修（换屋子之后 turn/end 熔静默失效）：
+        //
+        //   印章原来只写 `true`，于是重载 / 换通道时永远命中「already」，
+        //   旧 hook 还盯着**旧会话 id**，新屋子里的 turn/end 一次都不触发。
+        //   实测（隔离验证）：把 channelSessionId 指到测试会话后，
+        //   turn 2 已经 completed，日志里连 `turn-end-hook` 都没有——
+        //   只剩 tick 兜底每 60 秒补一次，看起来「能用」，其实是残的。
+        //
+        //   现在印章记「挂在哪条会话上」，并顺手卸掉上一枚（ctx.on 会返回取订函数）。
+        const prev = ctx[TURN_HOOK];
+        if (prev && typeof prev === 'object' && typeof prev.off === 'function') {
+          try { prev.off(); } catch { /* 卸不掉也不影响新的一枚 */ }
+        }
+        if (prev && prev?.id === CHANNEL_SESSION_ID) {
+          trace('turn-hook-already', { sessionId: CHANNEL_SESSION_ID });
+          return;
+        }
+        const off = ctx.on('session/event', async (s, event) => {
           try {
             if (!s || s.id !== CHANNEL_SESSION_ID) return;
             if (event?.type !== 'turn/end') return;
@@ -1055,12 +1081,15 @@ export function apply(ctx, config = {}) {
             trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
           }
         });
-        ctx[TURN_HOOK] = true;
+        ctx[TURN_HOOK] = { id: CHANNEL_SESSION_ID, off: typeof off === 'function' ? off : null };
         trace('turn-hook-armed', { sessionId: CHANNEL_SESSION_ID });
       } catch (err) {
         trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
       }
     };
+    // 诊断：证明真正的 armTurnHook 确实被赋值了（空实现和真实现 typeof 都是 function，
+    // 2026-10-28 就卡在这儿：kick 报 hasArm:"function"，可挂载日志一条都没有）。
+    trace('arm-defined', { sessionId: CHANNEL_SESSION_ID });
 
     /**
      * 把会话的**可见历史**整段替换成一条「融合后的记忆」。
@@ -1165,6 +1194,17 @@ export function apply(ctx, config = {}) {
       //   上了心跳才分得清「tick 没跑」和「tick 跑了但什么都没做」——
       //   14:05 那次停了 296 秒，日志里一片空白，只能猜。以后再不会了。
       trace('tick-alive', { n: ticks });
+      // ★ 2026-10-28 修（钩子会漏挂）：turn/end 的钩子原来只在 kick() 里挂一次，
+      //   而 kick 挂在 `ctx.inject([...])` 的回调上——实测重载之后
+      //   `channel-ready` 打了、`turn-hook-armed` 一条都没有，
+      //   于是「回完话立刻熔」静默退化回 tick 每分钟兜底。
+      //   现在每一跳都核一次：印章上的会话不是当前这条，就补挂。
+      //   幂等：同一会话重复调用会走 `turn-hook-already` 直接返回。
+      try {
+        if (ctx[TURN_HOOK]?.id !== CHANNEL_SESSION_ID) armTurnHook();
+      } catch (err) {
+        trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
+      }
       try {
         // ★ 每分钟看一眼她在不在。不在就（节流后）去开门。
         //
@@ -1419,8 +1459,10 @@ export function apply(ctx, config = {}) {
     //   直接调就绕过 schedule —— 不经过 next 的跳不会重新排队，
     //   两跳并发时只要有一跳卡住，schedule 链就再也没人接（实测 8 分钟无第 3 跳）。
     //   next() 内部有并发闸，重入也安全。
-    pokeWake = () => { next(); };
-    next();
+    // ★ wake:false 时不要启动节拍，但上面的函数都已经定义好、钩子也挂得上。
+    pokeWake = () => { if (cfg.wake) next(); };
+    if (cfg.wake) next();
+    else trace('wake-loop-disabled', { reason: 'cfg.wake=false，只熔不醒' });
     ctx.effect(() => () => {
       stopped = true;
       if (timer) clearTimeout(timer);
@@ -1923,6 +1965,7 @@ export function apply(ctx, config = {}) {
         try { armTurnHook(); } catch (err) {
           trace('turn-hook-failed', { err: String(err?.message ?? err).slice(0, 160) });
         }
+        trace('turn-hook-kick', { hasArm: typeof armTurnHook, sessionId: CHANNEL_SESSION_ID });
       }).catch((err) => { trace('channel-threw', { err: String(err?.message ?? err) }); });
     };
     const t = setTimeout(kick, 5000);
