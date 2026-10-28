@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.episode.6';
+const BUILD = '2026-10-28.associate.1';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -814,6 +814,10 @@ export function apply(ctx, config = {}) {
      * novel 被收完就没有了，所以这个花销是一次性的，不会持续烧。
      */
     let lastAdoptAt = 0;
+    // ★ 2026-10-28（阶段二）：联想的节流。和 adopt 分开记账——
+    //   一个是「把数出来的东西说成人话」，一个是「把两件旧事摆在一起」，
+    //   共用一个时间戳的话，谁先跑谁就把另一个人挤掉。
+    let lastAssociateAt = 0;
     const adoptInduced = async (mindInst) => {
       if (!cfg.adoptInduction) return 0;
       if (!synth || typeof synth.ask !== 'function') return 0;
@@ -1268,6 +1272,22 @@ export function apply(ctx, config = {}) {
         //   放在工具观测之后：这样这一跳新记的观测也能进归纳。
         try { await adoptInduced(m); } catch (err) {
           trace('adopt-failed', { err: String(err?.message ?? err).slice(0, 120) });
+        }
+
+        // ★ 2026-10-28（阶段二·联想）：醒着的时候，把两件旧事摆在一起。
+        //   这是 novel 唯一的来源——在这之前，内核数出来的东西全是从判断倒推的，
+        //   模型给过什么她才想得到什么。现在原料换成经历，她才有机会「自己发现」。
+        //   节流 10 分钟一次：联想不是每跳都该干的事，两件旧事也不会一分钟变一次。
+        try {
+          const every = Math.max(60_000, Number(cfg.associateEveryMs ?? 10 * 60_000));
+          const last = Number(lastAssociateAt ?? 0);
+          if (cfg.associate !== false && Date.now() - last >= every) {
+            lastAssociateAt = Date.now();
+            const r = await m.associate();
+            if (r.tried) trace('associate-done', r);
+          }
+        } catch (err) {
+          trace('associate-failed', { err: String(err?.message ?? err).slice(0, 140) });
         }
 
         const state = readWake(storePath);

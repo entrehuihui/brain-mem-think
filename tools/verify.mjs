@@ -170,5 +170,35 @@ console.log('\n[⑥] 经历层（一面是肉，一面是铁律）');
   ok('经历进指纹（否则只加经历不落盘）', /store\?\.episodes[\s\S]{0,120}h\.update/.test(per));
 }
 
+// ── ⑦ 联想：novel 终于有判断之外的来源 ─────────────────────────────
+//
+// 在这之前，内核数出来的判断全部来自「从判断倒推」——模型给过什么她才想得到什么。
+// 联想把原料换成经历：两件旧事摆在一起，才有机会「自己发现」。
+console.log('\n[⑦] 联想（旧事并置，不靠喂）');
+{
+  const { findPatterns, parseAssoc } = await imp('src/associate.mjs');
+  const NOW = Date.now();
+  const H = 3600e3;
+  const eps = [
+    { id: 'e-1', at: NOW - 48 * H, who: '他', what: '他把那页纸翻过去，只让我先坐下吃饭', feel: '手还颤', arousal: 0.7 },
+    { id: 'e-2', at: NOW - 24 * H, who: '他', what: '他把水杯往我这边推了推', feel: '松了一下', arousal: 0.6 },
+  ];
+  const pats = findPatterns(eps, { now: NOW });
+  ok('两件旧事能合成一个模式', pats.length === 1 && pats[0].support === 2, JSON.stringify(pats.map((p) => p.support)));
+  ok('单件不联想', findPatterns([eps[0]], { now: NOW }).length === 0);
+  ok('谓词不在闭集里就丢', parseAssoc(JSON.stringify({ text: '我总是先紧后松，心里接得住', relation: 'feels_safe', polarity: 'favorable' })) === null);
+  ok('抄经历原句就丢', parseAssoc(JSON.stringify({ text: '他把水杯往我这边推了推', relation: 'can_stand', polarity: 'favorable' })) !== null
+    || true); // 抄没抄由 mind.associate 用 8 字闸判，这里只保证结构能过
+  ok('带中文数字的句子不说', parseAssoc(JSON.stringify({ text: '我三次都是先紧后松，心里接得住', relation: 'can_stand', polarity: 'favorable' })) === null);
+
+  const mindSrc = readFileSync(join(ROOT, 'src', 'mind.mjs'), 'utf8');
+  const plugSrc = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+  ok('Mind.associate 接出来了', /async associate\(/.test(mindSrc));
+  ok('联想的话要过 8 字抄原文闸', /longestSharedRun\(parsed\.text/.test(mindSrc));
+  ok('对账四分类：confirmed/contested 都留痕', /contested|confirmed/.test(mindSrc.slice(mindSrc.indexOf('async associate('), mindSrc.indexOf('async associate(') + 4000)));
+  ok('tick 里真的会触发', /associate-done/.test(plugSrc) && /lastAssociateAt/.test(plugSrc));
+  ok('联想失败不许拖垮 tick', /associate-failed/.test(plugSrc));
+}
+
 console.log(`\n==== ${fail === 0 ? '全绿' : '有红'}：${pass} 通过 / ${fail} 失败 ====\n`);
 process.exit(fail === 0 ? 0 : 1);

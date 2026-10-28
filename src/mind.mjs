@@ -27,7 +27,7 @@ import {
   Belief, PREDICATES, RETIRE_REASON, STATUS, clean, normalizeRelation, recordTurn,
   setTension, similarity, stageWentForward, transition,
 } from './judge.mjs';
-import { createForge } from './forge.mjs';
+import { createForge, longestSharedRun } from './forge.mjs';
 import { createFade } from './fade.mjs';
 import { ABANDON_REASON, createCuriosity } from './curiosity.mjs';
 import { createRevision } from './revision.mjs';
@@ -38,6 +38,7 @@ import { strengthOfBelief, strengthFromEvidence } from './strength.mjs';
 import { eventFromBelief, eventFromJson, makeEvent } from './event.mjs';
 import { induce, reconcile } from './induct.mjs';
 import { addEpisode, episodeLines, pruneEpisodes } from './episode.mjs';
+import { buildAssocPrompt, findPatterns, parseAssoc } from './associate.mjs';
 
 /** 批次的临时分组键：还没熔出判断的材料暂时放在一起记账，它永远不落到任何一条判断上。 */
 const ORPHAN = '\u0000orphan';
@@ -753,12 +754,15 @@ export class Mind {
    * @param {object} p { actor, action, polarity, text, why, support, consistency, lastAt }
    * @returns {{adopted:boolean, id?:string, reason:string}}
    */
-  adoptClaim({ actor, action, polarity, text, why = '', support = 0, consistency = 0.5, lastAt = 0 } = {}) {
+  adoptClaim({ actor, action, polarity, text, why = '', support = 0, consistency = 0.5, lastAt = 0, minSupport = 3 } = {}) {
     const a = String(actor ?? '').trim();
     const act = String(action ?? '').trim();
     const t = String(text ?? '').trim();
     if (!a || !act || !t) return { adopted: false, reason: 'incomplete' };
-    if (Number(support) < 3) return { adopted: false, reason: 'thin' };
+    // ★ 2026-10-28（阶段二·联想）：门槛开成参数。
+    //   观测归纳要求 3 回（那是「反复发生」）；联想只要 2 件旧事（那是「又发生了一次」）。
+    //   两件事的证据强度不同，不该共用同一个死数。
+    if (Number(support) < Number(minSupport ?? 3)) return { adopted: false, reason: 'thin' };
 
     const themeKey = `${act}|${a}`;
     const now = this.now();
@@ -809,6 +813,83 @@ export class Mind {
     //   不落盘的话，下次重启她又把自己数出来的东西忘了。
     this.persist();
     return { adopted: true, id: b.id, reason: 'new' };
+  }
+
+  /**
+   * ★ 2026-10-28（阶段二）：醒着的时候，自己把两件旧事摆在一起。
+   *
+   * 这是 `novel` 唯一的来源。在这之前，内核数出来的判断全部来自「从判断倒推」，
+   * 所以 `reconcile` 里永远是 confirmed —— 模型给过什么，她才会想到什么。
+   *
+   * 分工是死的（同 express / induct 那条路）：
+   *   内核：挑哪两件事值得摆、数出隔了多久、见过几回（纯计数，不调模型）
+   *   模型：只说成一句人话，**谓词必须从闭集里挑**，不在闭集里就丢
+   *   内核：再对账（库里有没有同主题）——没有 → novel；反着 → contested；同向 → confirmed
+   *
+   * @returns {{tried:number, adopted:number, reason:string, id?:string, text?:string}}
+   */
+  async associate(opts = {}) {
+    if (typeof this.synth?.ask !== 'function') return { tried: 0, adopted: 0, reason: 'no-ask' };
+    const patterns = findPatterns(this.episodes, { now: this.now(), ...(opts.patterns ?? {}) });
+    if (!patterns.length) return { tried: 0, adopted: 0, reason: 'no-pattern' };
+
+    const p = patterns[0];
+    const material = (p.samples ?? []).map((s) => `${s.what}${s.feel ? `｜${s.feel}` : ''}`).join('\n');
+    let raw = null;
+    try {
+      raw = await this.synth.ask('你只输出 JSON，不要解释，不要代码块。', buildAssocPrompt(p, { name: this.personaName }), { maxTokens: 1500 });
+    } catch { raw = null; }
+    const parsed = parseAssoc(raw);
+    if (!parsed) return { tried: 1, adopted: 0, reason: 'unusable' };
+
+    // 第一铁律：把两件旧事摆在一起，也不许把它们的原句搬进判断。
+    if (longestSharedRun(parsed.text, [material]) >= 8) {
+      return { tried: 1, adopted: 0, reason: 'copied' };
+    }
+
+    const themeKey = `${parsed.relation}|${p.who}`;
+    const now = this.now();
+    const existing = this.store.active(themeKey);
+    if (existing) {
+      if (Number(existing.polarity) !== Number(parsed.polarity)) {
+        existing.tension = {
+          ...(existing.tension ?? { since: now }),
+          kind: 'conflict',
+          counterView: parsed.text,
+          counterSupport: p.support,
+          counterConsistency: 1,
+          because: '我自己把两件旧事摆在一起，看见的是另一面',
+          lastAt: now,
+        };
+        return { tried: 1, adopted: 0, reason: 'contested', id: existing.id };
+      }
+      return { tried: 1, adopted: 0, reason: 'confirmed', id: existing.id };
+    }
+
+    const r = this.adoptClaim({
+      actor: p.who,
+      action: parsed.relation,
+      polarity: parsed.polarity,
+      text: parsed.text,
+      why: parsed.why,
+      support: p.support,
+      consistency: 1,
+      lastAt: Number(p.samples?.[0]?.at) || now,
+      minSupport: 2,
+    });
+    // 观测的来源必须是 association —— 归纳那层靠这个字段分清
+    // 「模型熔给她的」和「她自己把两件旧事摆在一起看出来的」。
+    this.store.observe(makeEvent({
+      at: now,
+      actor: p.who,
+      action: parsed.relation,
+      polarity: parsed.polarity,
+      text: parsed.text,
+      themeKey,
+      source: 'association',
+      beliefId: r?.id ?? null,
+    }));
+    return { tried: 1, adopted: r?.adopted ? 1 : 0, reason: r?.reason ?? 'unknown', id: r?.id, text: parsed.text };
   }
 
   recall(query) {
