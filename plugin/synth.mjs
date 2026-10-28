@@ -139,6 +139,9 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
   let out = '';
   let reasoned = 0;
   const seen = {};
+  // 每一块的类型（text / reasoning / tool …）。熔那一路全是空的时候，
+  // 这一串能分清"它压根没开口"和"它开的是另一种口"。
+  const blockKinds = [];
 
   // ★★ 2026-10-28（tick 停摆，实测 296 秒无日志）—— 这一段的写法是被实验推翻过一次的。
   //
@@ -180,6 +183,10 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
       } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
         reasoned += chunk.text.length; // 只计数，绝不采用
       }
+      // 记下开了什么块（不采用内容，只要类型）：熔路全空时靠它分辨"没开口"和"开错口"
+      if (chunk.type === 'block-start') {
+        blockKinds.push(String(chunk.block?.type ?? chunk.block?.block?.type ?? 'unknown'));
+      }
       if (out.length > 6000) break; // 防跑飞
     }
   };
@@ -218,6 +225,13 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
     usage: seen.usage ?? 0,
     blocks: Object.keys(seen).join(','),
     reasonedChars: reasoned,
+    // ★ 2026-10-28 20:20（熔交白卷·第四层）：光看 blocks 还是分不清是
+    //   "流开了一次就关" 还是 "流开了两次、一次块都没吐"。
+    //   block-start 的块类型一起记下来：text / reasoning / 还是别的。
+    //   熔那一路如果 block-start 是 0，说明它连一轮正文都没开始；
+    //   如果是 1 个别的类型，那就是它把我们的话当成了别的活。
+    blockKinds: JSON.stringify(blockKinds),
+    streamOpened: seen['block-start'] ?? 0,
   });
   if (!said) return null;
   return said;
