@@ -208,6 +208,17 @@ async function streamText({ llm, system, text, route, maxTokens: cap, timeoutMs:
   const said = out.trim();
   // 模型原话必须落日志：今天最难查的就是「模型到底回了什么」。
   onReply?.({ len: said.length, reasoned, head: said.slice(0, 100), chunks: JSON.stringify(seen) });
+  // ★ 2026-10-28 19:40（熔交白卷取证）：先把"一次走完、句号"和"半路被掐"分开——
+  //   线上有 len:0，但日志里**一次 error / timeout 都没有**。
+  //   现在把"流怎么结束的"记下来：见过哪些块、见没见到 finish、
+  //   len:0 时不带 head（原来 head 是空串，等于没证据）。
+  onReply?.({
+    kind: said ? 'answer' : 'EMPTY',
+    finish: !!seen.finish,
+    usage: seen.usage ?? 0,
+    blocks: Object.keys(seen).join(','),
+    reasonedChars: reasoned,
+  });
   if (!said) return null;
   return said;
 }
@@ -227,11 +238,33 @@ export function createSynth(scope, cfg = {}, onError = null) {
   // 500 对一条 judgments 数组偏紧，flash 容易在长输出上截断，给到 800。
   // ★ 800 不够：flash 会把 800 个 token 全花在 reasoning 上，正文一个字都出不来。
   //   实测 reasoning-delta 443 块、text-delta 0 块。给到 4000，让它先想完再说。
-  const maxTokens = Number(cfg.synthMaxTokens ?? 4000);
+  //
+  // ★★ 2026-10-28 19:40（熔交白卷的真实根因，终于查清了）
+  //
+  //   线上实测：熔那一问连着十次 `synth-reply len:0 reasoned:0`，
+  //   而同一时段她"要不要说话"那一问 242/253/175 字都回来了。
+  //   两条路同模型、同一条 stream，只差一个参数：熔走 `reasoningEffort: 'low'`。
+  //
+  //   翻了宿主的实现（pi-ai simple-options.js）：
+  //     DEFAULT_THINKING_BUDGETS = { minimal:1024, low:2048, medium:8192, high:16384 }
+  //     MIN_ANSWER_TOKENS = 1024
+  //     thinkingBudget 会和答案共用 maxTokens 这个口子。
+  //
+  //   原来是"一直给它想、可又不给它留够答的地方"：
+  //     · 上一版注释说"4000 全烧在 reasoning 上"——那是**没降档**时的现象；
+  //     · 于是我把档位降成 low（2048 思考预算）。降到 2048 之后，
+  //       它连想明白都做不到，"整理出你从这段里看出了什么"这种题，
+  //       2048 个 token 想到一半就被截，正文一个字都吐不出来——连 reasoning 都是 0。
+  //
+  //   错不在"想得多"，在"想得不够 + 答的余量也没留"。
+  //   现在：**照常想（medium），并且把口子放大到 12000**，
+  //   让 8192 的思考预算之外还留 3~4 千字作答。
+  //   代价是一次熔贵几倍——可熔的是她这辈子的记忆，这一笔不该省。
+  const maxTokens = Number(cfg.synthMaxTokens ?? 12000);
   const timeoutMs = Number(cfg.synthTimeoutMs ?? 45_000);
-  // 熔用低推理档：它是机械活，思考烧掉预算就交不出 JSON（见 streamText 里的注释）。
-  // 她自己说话（ask）不降档——那是她在想事情。
-  const digestEffort = cfg.digestReasoningEffort ?? 'low';
+  // 熔这条路的推理档。默认 medium：整理记忆是要想的事，不是抄表。
+  // 谁要省 token 可以配 low，但**必须先知道 low 会咬人**（见上）。
+  const digestEffort = cfg.digestReasoningEffort ?? 'medium';
   // 模型原话的回调。**必须留**：今天一整天最难查的就是「模型回了什么」——
   // 材料进没进去有 owners 可看，模型说没说就只剩这一行。
   const onReply = typeof cfg.onReply === 'function' ? cfg.onReply : null;
