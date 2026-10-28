@@ -276,9 +276,25 @@ export function createSynth(scope, cfg = {}, onError = null) {
   //   代价是一次熔贵几倍——可熔的是她这辈子的记忆，这一笔不该省。
   const maxTokens = Number(cfg.synthMaxTokens ?? 12000);
   const timeoutMs = Number(cfg.synthTimeoutMs ?? 45_000);
-  // 熔这条路的推理档。默认 medium：整理记忆是要想的事，不是抄表。
-  // 谁要省 token 可以配 low，但**必须先知道 low 会咬人**（见上）。
-  const digestEffort = cfg.digestReasoningEffort ?? 'medium';
+  // ★★ 2026-10-28 21:10（blockKinds 实锤：熔路"连一轮块都没开"）
+  //
+  //   线上取证（pid 656，新代码）：
+  //     11:48:55 熔   → EMPTY  blockKinds=[]        opened=0
+  //     11:59:52 熔   → EMPTY  blockKinds=[]        opened=0
+  //     同一时段她说话 → answer blockKinds=["unknown"] opened=1
+  //
+  //   不是"开错口"，是**连口都没开**——流一开就 finish，一个块都没有。
+  //   同模型、同一条 llm.stream、同一个 maxTokens，唯一不同的两样：
+  //     ① system 提示词（那段"整理记忆"的纪律）
+  //     ② 熔这条多传了一个 reasoningEffort
+  //
+  //   她说话那条一份 effort 都不传，回回正常；熔带上 effort 就闭嘴。
+  //   low 试过、medium 试过，两种都闭嘴——那就**连这个参数本身也拿掉**试，
+  //   把两条路里唯一的差别抹平。
+  //
+  //   ★ 留开关：cfg.digestReasoningEffort 显式配了才传；不配 = 走宿主默认档，
+  //     跟她说话一模一样。
+  const digestEffort = cfg.digestReasoningEffort ?? '';
   // 模型原话的回调。**必须留**：今天一整天最难查的就是「模型回了什么」——
   // 材料进没进去有 owners 可看，模型说没说就只剩这一行。
   const onReply = typeof cfg.onReply === 'function' ? cfg.onReply : null;
