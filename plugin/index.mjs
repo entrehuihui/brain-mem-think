@@ -816,6 +816,12 @@ export function apply(ctx, config = {}) {
      */
     let lastChannelDigestAt = 0;
     /**
+     * ★ 2026-10-28 18:35：被 agent-busy 挡下的第一次时间戳（欠账）。
+     *   有欠账就说明「有东西等着熔、只是当时她正忙」——
+     *   等空下来第一拍补上，并落一行 `channel-digest-debt-settled` 记清欠了多久。
+     */
+    let digestDebtAt = 0;
+    /**
      * @param {object} mindInst
      * @param {{fromTurnEnd?: boolean}} [opt]
      *   fromTurnEnd = 这次是 turn/end 钩子叫的。
@@ -844,7 +850,26 @@ export function apply(ctx, config = {}) {
             return a?.status && a.status !== 'idle' ? a.status : null;
           } catch { return null; }
         })();
-        if (busyAgent) { trace('channel-digest-skip', { why: 'agent-busy', status: busyAgent }); return; }
+        if (busyAgent) {
+          // ★ 2026-10-28 18:35：忙，但**别让这一轮白白过去**。
+          //
+          //   实测近 15 分钟 30 次 tick 全被这条挡下（why:agent-busy 30/30），
+          //   而这 15 分钟里 `turn-end-hook` 一次都没出现——
+          //   也就是说 turn/end 那条"权威信号"这条路当天是断的，
+          //   于是每一条 tick 都撞在这道闸上，熔一次都没跑。
+          //
+          //   记忆不会因为晚几分钟丢，但**晚几个小时就等于丢**。
+          //   所以忙就挂个欠账（记时间戳），等空了第一拍把它补上，
+          //   并落一行 `channel-digest-debt-settled` 记清欠了多久。
+          const stamp = Date.now();
+          if (!digestDebtAt) digestDebtAt = stamp;
+          trace('channel-digest-skip', { why: 'agent-busy', status: busyAgent, debtMs: stamp - digestDebtAt });
+          return;
+        }
+        if (digestDebtAt) {
+          trace('channel-digest-debt-settled', { waitedMs: Date.now() - digestDebtAt });
+          digestDebtAt = 0;
+        }
       } else {
         trace('channel-digest-from-turn-end', { skipIdleGate: true });
       }
