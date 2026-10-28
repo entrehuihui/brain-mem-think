@@ -88,11 +88,22 @@ export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth 
   }
 
   // ③ 机械守卫：这一轮到底能不能问她。
+  //
+  // ★ 2026-10-28（观察模式）：冷却与配额原来是 src/wake.mjs 里的写死默认
+  //   （说完 45 分钟内不再开口、一小时最多 2 次）。主人把节拍调到 30 秒想看清
+  //   「醒 → 想 → 说不说」这一串，可 45 分钟冷却会让她全程沉默，什么现象都看不到。
+  //   所以这三样开成配置；不填就还是原来的默认值，行为不变。
+  const gateOpts = {};
+  for (const k of ['quietAfterSpeakMs', 'speakWindowMs', 'maxSpeakInWindow']) {
+    const v = Number(cfg[k]);
+    if (Number.isFinite(v) && v > 0) gateOpts[k] = v;
+  }
   const g = gate(notes, {
     lastSpokeAt: st.lastSpokeAt ?? null,
     now,
     history: Array.isArray(st.window) ? st.window : [],
     gap: everyMs,
+    opts: gateOpts,
   });
   if (!g.pass) {
     return { woke: true, action: 'silent', because: g.why, ledger: g.ledger };
