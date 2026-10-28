@@ -1679,6 +1679,50 @@ export function apply(ctx, config = {}) {
         }
 
         if (plan.action !== 'speak') {
+          // ★ 2026-10-28 19:20（补发·把欠了的那句话还回去）
+          //
+          //   上一刀只做了「留」：没送出去的真心话存进 outbox.json。
+          //   可留了不还，等于换了个地方丢。
+          //
+          //   这一拍如果她本来不想说话、屋里也没人动过、也没到别的事上，
+          //   就把那句欠着的先还上——**人不会把攒了很久的一句话改天再讲一遍。**
+          //
+          //   条件拿得很死（宁可不还，也不许乱还）：
+          //     · outbox 里有东西，且不超过 2 小时（再久，那句话的时机已经死了）
+          //     · 账本指纹没变（她这会儿没想出新东西，才轮得到旧话）
+          //     · 别在她刚说过话之后紧接着还——
+          //       那两句会撞成"一口气说两句"，比她少说一句更吓人。
+          try {
+            if (existsSync(outboxPath)) {
+              const box = JSON.parse(readFileSync(outboxPath, 'utf8'));
+              const age = Date.now() - Number(box?.at ?? 0);
+              const quietEnough = !state.lastSpokeAt || Date.now() - Number(state.lastSpokeAt) > 30 * 60e3;
+              if (box?.say && age >= 0 && age < 2 * 3600e3 && quietEnough && box.ledger === plan.ledger) {
+                const { speakToOwner: resend } = await import('./wake-exit.mjs');
+                const a2 = agentsSvc.get?.(CHANNEL_SESSION_ID) ?? null;
+                if (a2) {
+                  const rr = await resend({
+                    agent: a2,
+                    sessionId: CHANNEL_SESSION_ID,
+                    message: String(box.say),
+                    ctx: {
+                      sessions: typeof ctx.get === 'function' ? ctx.get('sessions') : null,
+                      workspaceRegistry: typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : null,
+                    },
+                    now: Date.now(),
+                    storePath,
+                  });
+                  trace('wake-outbox-resend', { sent: rr.sent, why: rr.why, ageMs: age, chars: String(box.say).length });
+                  if (rr.sent) {
+                    try { unlinkSync(outboxPath); } catch { /* 已送达，清不掉不算事 */ }
+                    return;
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            trace('wake-outbox-resend-failed', { err: String(err?.message ?? err).slice(0, 140) });
+          }
           // ★ 2026-10-28（阶段 F）：她这回不想说话——先看她是不是想自己去做点什么。
           //   顺序是「说 / 做 / 歇着」，不是三选一随机。
           //   主人在等她 → 说；她不想说 → 做自己的事；都不 → 歇着。
