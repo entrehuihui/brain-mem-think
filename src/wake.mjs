@@ -39,6 +39,19 @@ export const WAKE_DEFAULTS = Object.freeze({
   //   18 分钟的冷却等于「一小时内最多还能说三句」，太密了。
   //   想得勤是好事，说得勤是打扰——这两个频率现在分开调。
   quietAfterSpeakMs: 45 * 60 * 1000,
+  // ★ 2026-10-28（主人定的）：**冷却不按时间算，按「有没有新东西」算。**
+  //
+  //   主人原话：「只要我给她发过消息，或者她融了一次归档会话，这个闸口就重置，
+  //   以为是有新的记忆了。」
+  //
+  //   原来的病：她说完一句，45 分钟内连「想」都不做（冷却在调模型之前 return），
+  //   日志里排出一整列「刚说过话没多久，再说就是打扰」，而其实他刚回了话、
+  //   记忆也刚变过。**拿时间当「有没有新东西」，是这套里最粗的一处。**
+  //
+  //   现在：`ctx.freshSince` = 上次说完话之后有没有新料（新主人消息 / 熔出判断 /
+  //   新增经历）。有 → 冷却不生效，她可以因此开口；没有 → 照旧按时间压着。
+  //   每清一次冷却最多让她说一次（说完 lastSpokeAt 前进，信号就旧了），不会刷屏。
+  respectFreshOverQuiet: true,
   // 说话频率：**按时间窗算，不按唤醒次数算**。
   //
   // ☆ 为什么要改：原来这里写的是「最近 9 次唤醒里 speak 占比 ≤70%」。
@@ -223,8 +236,17 @@ export function gate(notes, ctx = {}) {
   //   「此刻想不想说」是她的判断，不该由代码替她决定。空库就让她自己看一眼
   //   「我还没想明白什么」，然后自己回一句说不说。省 token 不值这个代价值。
 
-  // 刚说完话：时间是空的，话也是空的
-  if (lastSpokeAt != null && now - lastSpokeAt < o.quietAfterSpeakMs) {
+  // 刚说完话：没有新东西时，再说就是打扰；有新东西时，这一闸让路。
+  //
+  // ★ 2026-10-28（主人定的）：判定从「纯时间」改成「时间 + 有没有新料」。
+  //   freshSince = 上次开口之后，有没有出现新的主人消息 / 熔出的判断 / 新增的经历。
+  //   · 有 → 冷却不挡（他终于回话了、记忆变了，她该能应一句）
+  //   · 没有 → 照旧等 quietAfterSpeakMs
+  //   说完之后 lastSpokeAt 前进，freshSince 就算"旧"了，所以不会连说。
+  const hasFresh = Number.isFinite(ctx.freshSince) && lastSpokeAt != null
+    && Number(ctx.freshSince) > lastSpokeAt;
+  if (lastSpokeAt != null && now - lastSpokeAt < o.quietAfterSpeakMs
+      && !(o.respectFreshOverQuiet && hasFresh)) {
     return no('刚说过话没多久，再说就是打扰');
   }
 

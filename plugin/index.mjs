@@ -33,7 +33,7 @@ import { createFileIo, defaultJudgmentPath } from '../src/persist.mjs';
 import { createSynth } from './synth.mjs';
 import { ownerMessages } from './collect.mjs';
 import { planWake, applyWake, resetTalkState } from './awake.mjs';
-import { readWake, sweepTemps, defaultPath } from './wake-store.mjs';
+import { readWake, writeWake, sweepTemps, defaultPath } from './wake-store.mjs';
 import { installModelSelection } from './selection.mjs';
 import { readCursors, writeCursor, sliceFresh } from './digest-cursor.mjs';
 import { planFullShadow } from './shadow-plan.mjs';
@@ -104,13 +104,24 @@ const CHANNEL_ID_RE = /^session-[0-9a-f-]{8,}$/i;
  */
 const FALLBACK_CHANNEL_ID = 'session-e18b264f-41f5-454b-b1eb-0f814cdd9c5c';
 let CHANNEL_SESSION_ID = null;
+
+/**
+ * ★ 2026-10-28 18:05（止血·热渲染）：上一次渲染的指纹。
+ *
+ * `mind:world` 这个 section 的 `text()` 是被**每次取系统提示时都调一次**的，
+ * 不是每轮调一次。实测半小时 1908 次全是同一份 880 字。
+ * 渲染本身没变贵，**是日记变贵了**——每次渲染写一行日志，
+ * 半小时撑到 1MB，日志一贵，所有靠日志取证的自查全废。
+ * 所以：内容没变就不写。
+ */
+let lastWorldFp = '';
 const MIND_TAG = '<mind>';
 
 /**
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.want.3';
+const BUILD = '2026-10-28.fresh.1';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -222,6 +233,23 @@ function trace(event, extra) {
 //   我原来用 ctx.get('webServer') + 自己轮询，是把宿主已经做好的事又做了一遍，
 //   而且第一次写还漏了重试 → 重启后接口 404。
 export const inject = ['webServer'];
+
+/**
+ * ★ 2026-10-28（主人定的）：给「有新东西」打一个时刻标记。
+ *
+ * 冷却闸拿它跟 lastSpokeAt 比：比它新，说明他说过话 / 记忆变了 —— 冷却让路。
+ * 三种来源都算：新主人消息、熔出判断、新增经历。
+ */
+function markFresh(path, why) {
+  try {
+    const st = readWake(path);
+    const next = { ...st, freshSince: Date.now() };
+    writeWake(path, next);
+    trace('fresh-marked', { why });
+  } catch (err) {
+    trace('fresh-mark-failed', { why, err: String(err?.message ?? err).slice(0, 120) });
+  }
+}
 
 export function apply(ctx, config = {}) {
   // ★ 第一行就写盘：以后「插件没反应」这件事，第一眼就能分清
@@ -639,13 +667,20 @@ export function apply(ctx, config = {}) {
           if (!mind) return '';
           const focus = currentFocus();
           const world = mind.world ? mind.world({ name: cfg.name, focus }) : '';
-          // ★ 2026-10-28（阶段四）：留一行证据——这一轮到底摆了几条、有没有情境。
-          //   不加这行，部署完只能靠猜「检索有没有生效」。
-          trace('world-render', {
-            focus: !!focus,
-            chars: world.length,
-            lines: world ? world.split('\n').filter(Boolean).length : 0,
-          });
+          // ★ 2026-10-28 18:05（止血·热渲染）：这行日志原来**每次渲染都写一条**，
+          //   实测半小时 1908 次（同一份 880 字、同一个 focus:false），
+          //   日志撑到 >1MB、进程 WS 556MB。
+          //   日志的价值在「变了没有」，不在于「又跑了一次」——
+          //   指纹不变就不写，只在**内容真的换了**的时候落一行。
+          const fp = `${!!focus}|${world.length}|${focus ? String(focus.text).slice(0, 40) : ''}`;
+          if (fp !== lastWorldFp) {
+            lastWorldFp = fp;
+            trace('world-render', {
+              focus: !!focus,
+              chars: world.length,
+              lines: world ? world.split('\n').filter(Boolean).length : 0,
+            });
+          }
           if (!world) return '';
           return `${MIND_TAG}\n${world}\n${MIND_TAG.replace('<', '</')}`;
         } catch {
@@ -829,6 +864,8 @@ export function apply(ctx, config = {}) {
       }
       // ★ 2026-10-28（阶段 F）：主人在说话，时钟往前走。她这十分钟不许出门。
       lastOwnerMessageAt = Date.now();
+      // ★ 2026-10-28：主人说了话 = 有新东西 → 冷却让路
+      markFresh(storePath, 'owner-message');
 
       const cursors = readCursors(cursorPath);
       const { fresh, total, reset, cursor } = sliceFresh(owners, cursors[CHANNEL_SESSION_ID] ?? 0);
@@ -864,6 +901,7 @@ export function apply(ctx, config = {}) {
         if (n > 0 || eps > 0) {
           writeCursor(cursorPath, CHANNEL_SESSION_ID, total);
         }
+        if (n > 0 || eps > 0) markFresh(storePath, 'digest');
         trace('channel-digest-done', {
           fresh: fresh.length,
           total,
@@ -1029,6 +1067,7 @@ export function apply(ctx, config = {}) {
             source: p.kind === 'want' ? 'want' : 'act',
           });
           if (ep?.ok) trace('act-episode', { what: ep.what, source: p.kind === 'want' ? 'want' : 'act' });
+          if (ep?.ok) markFresh(storePath, 'episode');
         } catch (err) {
           trace('act-episode-failed', { err: String(err?.message ?? err).slice(0, 120) });
         }
