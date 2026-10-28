@@ -18,6 +18,7 @@ import { STATUS } from './judge.mjs';
 import { clause, linesOf, toNote } from './flash.mjs';
 import { episodeLines } from './episode.mjs';
 import { weightWithSting } from './sting.mjs';
+import { recallFor } from './recall.mjs';
 
 export const WORLD_DEFAULTS = Object.freeze({
   // ★ 2026-10-27 大乔调（主人点破的：库里有 12 条现役，她只看得见一半）。
@@ -137,11 +138,18 @@ export function renderWorld(beliefs, opts = {}) {
   });
 
   const byWeight = (a, b) => mag(b) - mag(a);
-  const held = notes
-    .filter((n) => n.status === 'held' && (n.weight ?? 0) >= o.minWeightToShow)
+  // ★ 2026-10-28（阶段四·情境检索）：给了 focus 就只取「当下想得起来的几条」。
+  //   没给 focus 就退回全量——老调用方（测试、归档渲染）一个字都不用改。
+  const recall = o.focus ? recallFor(o.focus, notes, { maxHeld: o.maxHeld }) : null;
+  const held = recall
+    ? recall.held.filter((n) => n.status === 'held').sort(byWeight)
+    : notes
+      .filter((n) => n.status === 'held' && (n.weight ?? 0) >= o.minWeightToShow)
+      .sort(byWeight)
+      .slice(0, o.maxHeld);
+  const open = (recall ? recall.held.filter((n) => n.status === 'open') : notes.filter((n) => n.status === 'open'))
     .sort(byWeight)
-    .slice(0, o.maxHeld);
-  const open = notes.filter((n) => n.status === 'open').sort(byWeight).slice(0, o.maxOpen);
+    .slice(0, o.maxOpen);
   const retired = notes
     .filter((n) => n.status === 'retired' && n.forgottenBecause == null)
     .sort(byWeight)
@@ -169,7 +177,12 @@ export function renderWorld(beliefs, opts = {}) {
   //     关于我自己：
   //       <A>      ← 重复
   //   修法：先把 identity 那条单独拎出来给第一句，后面两段都从它之后取。
-  const liveSelf = notes.filter((n) => n.status === 'held' || n.status === 'open');
+  // ★ 2026-10-28（阶段四）：「关于我自己」这一段的来源也要受检索约束。
+  //   原来它从**全量**现役里挑，于是就算 held 只取了三条，
+  //   这一段又能捞出两条没被检索到的——总条数照样爆。实测 focus 模式下还是 5 条。
+  const liveSelf = recall
+    ? recall.held
+    : notes.filter((n) => n.status === 'held' || n.status === 'open');
   const idNote = liveSelf.find((n) => n.kind === 'identity') ?? null;
   const selfNotes = liveSelf
     .filter((n) => (isAboutSelf(n) || n.kind === 'identity') && n !== idNote)

@@ -226,5 +226,43 @@ console.log('\n[⑧] 扎心度（独立于次数的情绪权重）');
   ok('落盘前重算扎心度', /persist\(\)[\s\S]{0,700}refreshSting\(\)/.test(mindSrc2));
 }
 
+// ── ⑨ 情境检索：按当下取几条，不是把整库摆在眼前 ─────────────────
+console.log('\n[⑨] 情境检索（3-5 条，不是全库）');
+{
+  const { recallFor } = await imp('src/recall.mjs');
+  const mk = (id, text, extra = {}) => ({
+    id, status: extra.status ?? 'held', kind: extra.kind ?? 'episodic', text, why: '有理由的',
+    themeKey: extra.themeKey ?? 'wants|他', subject: extra.subject ?? '他', relation: 'wants',
+    polarity: 1, strength: 0.6, sting: 0, weight: 0.6, createdAt: 1, turns: [],
+  });
+  const beliefs = [
+    mk('b1', '他总在催我快点，可我还没看明白', { themeKey: 'pushes|他' }),
+    mk('b2', '他嘴上说随便，其实想要我挑'),
+    mk('b3', '我妈打电话只报平安，不让我担心', { themeKey: 'hides|母亲', subject: '母亲' }),
+    mk('b4', '我该先看手里有没有真东西，再开口', { kind: 'identity' }),
+    mk('b5', '他还没说清楚那件事到底要不要我插手', { status: 'open' }),
+  ];
+  const r = recallFor({ text: '他今天又在催我' }, beliefs, { maxHeld: 3 });
+  const ids = r.held.map((n) => n.id);
+  ok('相关的那条被取到', ids.includes('b1'), JSON.stringify(ids));
+  ok('身份永远留', ids.includes('b4'));
+  ok('悬案永远留', ids.includes('b5'));
+  ok('条数受 maxHeld 约束（含底色）', r.held.length <= 5, 'len=' + r.held.length);
+
+  const irrelevant = recallFor({ text: '今天天气不错' }, beliefs, { maxHeld: 3 });
+  ok('完全不相关时只留底色', irrelevant.held.every((n) => n.kind === 'identity' || n.status === 'open'));
+
+  const { renderWorld } = await imp('src/world.mjs');
+  const withFocus = renderWorld(beliefs, { name: '小乔', focus: { text: '他今天又在催我' }, maxHeld: 3 });
+  const without = renderWorld(beliefs, { name: '小乔' });
+  ok('给了情境：无关的沉下去', !withFocus.text.includes('她不喜欢别人替她做决定') && !withFocus.text.includes('我妈打电话'));
+  const heldAll = beliefs.filter((b) => b.status === 'held');
+  ok('没给情境：全部现役都看得见（兼容）', heldAll.every((b) => without.text.includes(b.text)));
+
+  const plugSrc2 = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+  ok('注入时真的传了当下情境', plugSrc2.includes('focus: currentFocus()'));
+  ok('取不到情境时退回（不硬撑）', /const currentFocus = \(\) => [\s\S]{0,700}return null/.test(plugSrc2));
+}
+
 console.log(`\n==== ${fail === 0 ? '全绿' : '有红'}：${pass} 通过 / ${fail} 失败 ====\n`);
 process.exit(fail === 0 ? 0 : 1);

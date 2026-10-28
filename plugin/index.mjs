@@ -109,7 +109,7 @@ const MIND_TAG = '<mind>';
  * 构建标记。改完一定要改它——日志里那一行 `mind-build` 是
  * 「这次跑的是不是新代码」唯一能当场核对的证据。
  */
-const BUILD = '2026-10-28.sting.1';
+const BUILD = '2026-10-28.recall.1';
 
 /**
  * 遮蔽旧上下文时，**末尾这几条绝不遮**。
@@ -230,6 +230,22 @@ export function apply(ctx, config = {}) {
   trace('mind-build', { build: BUILD });
   process.stderr.write('mind: apply() entered\n');
   const cfg = resolveConfig(config);
+
+  /**
+   * ★ 2026-10-28（阶段四·情境检索）：当下这件事 = 她最近一条主人原话。
+   *   世界渲染拿它决定「想起哪几条」，不再是整库摆出来。
+   *   取不到就返回 null —— 调用方退回全量，绝不因为拿不到会话就少给她记忆。
+   */
+  const currentFocus = () => {
+    try {
+      const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : null;
+      const s = sessions?.get?.(CHANNEL_SESSION_ID);
+      const owners = ownerMessages(s?.deriveMessages?.() ?? []);
+      const last = owners[owners.length - 1]?.text;
+      if (last) return { text: String(last).slice(0, 200) };
+    } catch { /* 取不到就全量 */ }
+    return null;
+  };
   // 通道 id 允许在配置里覆盖（换机器、换人设都可能要换）
   if (cfg.channelSessionId) CHANNEL_SESSION_ID = String(cfg.channelSessionId);
   if (!cfg.enabled) {
@@ -553,7 +569,15 @@ export function apply(ctx, config = {}) {
       text: () => {
         try {
           if (!mind) return '';
-          const world = mind.world ? mind.world({ name: cfg.name }) : '';
+          const focus = currentFocus();
+          const world = mind.world ? mind.world({ name: cfg.name, focus }) : '';
+          // ★ 2026-10-28（阶段四）：留一行证据——这一轮到底摆了几条、有没有情境。
+          //   不加这行，部署完只能靠猜「检索有没有生效」。
+          trace('world-render', {
+            focus: !!focus,
+            chars: world.length,
+            lines: world ? world.split('\n').filter(Boolean).length : 0,
+          });
           if (!world) return '';
           return `${MIND_TAG}\n${world}\n${MIND_TAG.replace('<', '</')}`;
         } catch {
@@ -1160,7 +1184,7 @@ export function apply(ctx, config = {}) {
           return false;
         }
 
-        const memory = (mindInst?.world ? mindInst.world({ name: cfg.name }) : '') || '';
+        const memory = (mindInst?.world ? mindInst.world({ name: cfg.name, focus: currentFocus() }) : '') || '';
         if (!memory.trim()) { trace('compact-skip', { why: 'empty-memory' }); return false; }
 
         const data = {
