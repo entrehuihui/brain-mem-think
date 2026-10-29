@@ -1588,6 +1588,66 @@ export function apply(ctx, config = {}) {
           const sess = typeof ctx.get === 'function'
             ? ctx.get('sessions')?.get?.(CHANNEL_SESSION_ID)
             : null;
+          // ★ 2026-10-29 大乔加（只读探针，不改任何逻辑）：
+          //   tool-observe 从来没有留下过 tool-cursor.json，连 failed 都没有一条，
+          //   说明它在进 observeTools 之前就静默返回了。这里把「取到了什么」记下来：
+          //   sessions 服务在不在、会话取没取到、事件流是数组还是 Map、条数、maxSeq。
+          //   只为看清卡在哪一环，不进任何判断。看清后即可删除。
+          try {
+            const sessionsSvc = typeof ctx.get === 'function' ? ctx.get('sessions') : null;
+            const ev = sess?.events;
+            const evKind = Array.isArray(ev) ? 'array'
+              : (ev && typeof ev.values === 'function') ? 'map'
+                : (ev === undefined ? 'undefined' : ev === null ? 'null' : typeof ev);
+            let n = 0; let maxSeq = 0; let nToolCall = 0;
+            if (Array.isArray(ev) || (ev && typeof ev.values === 'function')) {
+              const list = Array.isArray(ev) ? ev : [...ev.values()];
+              n = list.length;
+              for (const e of list) {
+                const s = Number(e?.seq);
+                if (Number.isFinite(s) && s > maxSeq) maxSeq = s;
+                if (e?.type === 'tool/call') nToolCall += 1;
+              }
+            }
+            trace('sess-probe', {
+              hasSessionsSvc: !!sessionsSvc,
+              hasGet: typeof sessionsSvc?.get === 'function',
+              hasSess: !!sess,
+              sessId: sess?.id ?? null,
+              wantId: CHANNEL_SESSION_ID,
+              evKind,
+              n,
+              maxSeq,
+              nToolCall,
+              duringActHint: true,
+            });
+          } catch (probeErr) {
+            trace('sess-probe-failed', { err: String(probeErr?.message ?? probeErr).slice(0, 160) });
+          }
+          // ★ 2026-10-29 大乔加（第二探针，只读）：sess.events 是 undefined，
+          //   但磁盘上明明有 961 个事件。把会话对象自身的形状列出来，找出事件挂在哪。
+          try {
+            if (sess) {
+              const own = Object.keys(sess);
+              const protoKeys = (() => {
+                try { return Object.getOwnPropertyNames(Object.getPrototypeOf(sess)).slice(0, 40); }
+                catch { return []; }
+              })();
+              const shape = {};
+              for (const k of [...own, ...protoKeys].slice(0, 60)) {
+                try {
+                  const v = sess[k];
+                  shape[k] = Array.isArray(v) ? `array(${v.length})`
+                    : (v && typeof v.values === 'function') ? 'map-like'
+                      : (v && typeof v === 'object') ? `obj{${Object.keys(v).slice(0, 8).join(',')}}`
+                        : typeof v;
+                } catch { shape[k] = '<throws>'; }
+              }
+              trace('sess-shape', { own, protoKeys, shape });
+            }
+          } catch (probe2Err) {
+            trace('sess-shape-failed', { err: String(probe2Err?.message ?? probe2Err).slice(0, 160) });
+          }
           if (sess) {
             const act = readMotive(motivePath);
             // 她自己出去那一趟里的调用，全记；平常只有失败的才记
