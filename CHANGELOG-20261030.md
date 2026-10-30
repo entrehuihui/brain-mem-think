@@ -179,3 +179,50 @@ cordis.patch.yml                默认配额 3→6、间隔 40→20 分钟
   → 熔料口径改成「她的话也进材料」：打 `〔她〕` 标记、截 120 字、挂在她要回应的那次发言下面，
   提示词明令**不能当根据**（防她给自己造证据）。
 - `acceptance/h_digest_whitelist.mjs` 相应加测。
+
+---
+
+## 八、追加：插件注入隔离（同日，主人问「meow-memory 会不会影响我这个插件」）
+
+### 查证方式（不是读代码猜的）
+
+按 zstd 帧魔数切分、逐帧解压真会话（1403 条事件），统计 `source.kind` 分布：
+
+```
+plugin:meow-memory   8   ← 长期记忆块 / 情境注入 / 「记忆反思任务」
+user                 8   ← 主人真说的话
+runtime-context / skill-catalog / time-context / agent-instructions / repeat-tool-reminder …
+```
+
+**关键发现**：meow-memory 塞进来的消息 **`role` 是 `user`**，靠 `source.kind = plugin:meow-memory` 区分。
+也就是说：白名单只要看一眼 role，这些字就全会变成「主人的经历」熔进判断库。
+
+### 现状：已被拦下
+
+拿 `collect.mjs` 的真判据实测这 8 条：
+
+```
+[plugin:meow-memory] role=user → 白名单判定: 拦下 (source_not_owner:plugin:meow-memory)
+```
+
+另外抽查 4 个会话共 **495 条 `user/message`，其中没有来源标记的 0 条** ——
+所以「拿不到 source.kind 就按 role 放行」那条口子当前**没有任何一条命中**。
+
+### 这一刀只补牙，不动生产逻辑
+
+生产代码一行没改（白名单本来就是名单制，`plugin:*` 天然不在内）。
+新增 `acceptance/v_plugin_inject.mjs`（6 测），钉住这条防线：
+
+| # | 判据 |
+|---|---|
+| V1 | `plugin:meow-memory`（role=user）必须拦 |
+| V2 | `runtime-context` / `skill-catalog` / `time-context` / `agent-instructions` / `plugin:mcp` 全拦 |
+| V3 | `kind=user` 的真主人消息照常放行（不能为堵注入把她的话也吞了） |
+| V4 | **已知边界显式记录**：无 `source.kind` 的老消息按 role 放行；实测当前 0 条命中 |
+| V5 | 负控制：只看 role 的实现必须红 |
+| V6 | 端到端：整段会话过 `ownerMessages`，只留下主人那 1 条 |
+
+> 为什么不改生产代码：把「无 kind 一律不收」写死，会在宿主改结构时把主人的真话一起吞掉；
+> 现在实测 0 条命中，没必要动。真出事时 V4 会先亮出来，而不是悄悄发生。
+
+**仍未做的事**：两边 `text="NULL"` 的坏条目还在（mind 判断库 2 条），未清理。

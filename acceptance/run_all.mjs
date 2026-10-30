@@ -67,6 +67,9 @@ const SUITE = [
   // ★ 2026-10-30 加：主人「要让主动性真落地」——被挡回来的事要能补做，
   //   但不能烂在手里（要过期、要放手）。
   { key: 'u', file: 'acceptance/t_debt_retry.mjs', title: '主动欠账（挡下来的能补做·到期会放手）' },
+  // ★ 2026-10-30 加：主人问「meow-memory 会不会影响我这个插件」——
+  //   别的插件塞进来的字（plugin:*、runtime-context…）一条都不许进熔炉。
+  { key: 'v', file: 'acceptance/v_plugin_inject.mjs', title: '插件注入隔离（别家的字不许进熔炉）' },
   { key: 'r1', file: 'acceptance/redteam/r1_paraphrase_alive.mjs', title: '对抗·换皮冒充会想多' },
   { key: 'r2', file: 'acceptance/redteam/r2_correction_driven.mjs', title: '对抗·被纠正冒充会改自己' },
   { key: 'r3', file: 'acceptance/redteam/r3_curiosity_loop.mjs', title: '对抗·死循环冒充会追问' },
