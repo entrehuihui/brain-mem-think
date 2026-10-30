@@ -38,6 +38,9 @@ const OWNER_ROLES = new Set(['user', 'human', 'owner']);
  */
 const OWNER_SOURCE_KINDS = new Set(['user', 'human', 'owner']);
 
+/** 她自己说的话可能的角色写法（白名单，认不出一律不收）。 */
+const HER_ROLES = new Set(['assistant', 'agent', 'bot', 'model']);
+
 /** 认不出的、一律不收。宁可漏记，不要灌垃圾。 */
 const NEVER = new Set(['assistant', 'agent', 'bot', 'tool', 'system', 'function', 'developer']);
 
@@ -112,6 +115,51 @@ export function ownerMessages(messages) {
   for (const m of Array.isArray(messages) ? messages : []) {
     const c = checkMessage(m);
     if (c.ok) out.push({ text: c.text, role: 'user' });
+  }
+  return out;
+}
+
+/**
+ * ★ 2026-10-29 主人亲口改的口径：「我说的话 —— 这个也要进」。
+ *
+ *   原来的铁律是「只收主人说的」，理由是防她给自己造证据（她说一句 → 落进历史
+ *   → 下次归档当成「发生过的事」熔进去 → 越说越确信）。
+ *   那条顾虑是真的，但代价也真的发生了：一段来回里「她怎么应的、后来怎么变的」
+ *   全在她那一半，只喂主人的话，熔出来的判断永远缺半边事。
+ *
+ *   折中做法——**她的话进材料，但打上标记、降权、并且明令不许单独当证据**：
+ *     · 主人说的话：原样进去，是证据
+ *     · 她说的话：缩到 HER_TURN_MAX 字、附在它要回应的那次主人发言下面，
+ *       前缀 `〔她〕`，提示词里明写「只能解释上下文，不能作为判断的根据」
+ *
+ *   这样「说过什么、应了什么」的脉络留住了，
+ *   而「她在给自己造证据」这条缝隙用提示词 + 截断堵上。
+ *
+ * @returns {Array<{text:string, role:'user'|'model'}>}
+ */
+export const HER_TURN_MAX = 120;
+
+export function conversationTurns(messages) {
+  const out = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    // 主人说的：走原来的白名单，一个字都不改。
+    const c = checkMessage(m);
+    if (c.ok) {
+      out.push({ text: c.text, role: 'user' });
+      continue;
+    }
+    // 她说的话：只认「明确是她/是模型」的，其余（工具结果、系统注入）照旧不收。
+    const role = roleOf(m);
+    const srcKind = String(m?.source?.kind ?? '').toLowerCase();
+    const hers = HER_ROLES.has(role)
+      || HER_ROLES.has(srcKind)
+      || srcKind === 'mind-wake';
+    if (!hers) continue;
+    // 工具调用、系统注入混在 her 里的，再滤一道。
+    if (srcKind && NEVER.has(srcKind)) continue;
+    const text = textOf(m).replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    out.push({ text: text.slice(0, HER_TURN_MAX), role: 'model' });
   }
   return out;
 }

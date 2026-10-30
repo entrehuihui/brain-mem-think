@@ -39,6 +39,21 @@ export const DIGEST_DEFAULTS = Object.freeze({
  * 为什么只收 user：她的经历里，「发生了什么」是主人那边给的；
  * 她说的话已经变成判断了，再拿她自己的话当材料，等于让她自己回声自己。
  */
+/**
+ * 把一段会话拼成材料。只用一次，不存。
+ *
+ * ★ 2026-10-29 主人改口径：「我说的话 —— 这个也要进」。
+ *   原来这里只收 user，她自己的话一个字都不进。防的是「她给自己造证据」，
+ *   但代价是一段来回里「她怎么应的、后来怎么变的」全丢了。
+ *   现在两样都进，但**分量不一样**：
+ *     · 主人说的：原样，一行一条，是证据
+ *     · 她说的：缩到 HER_TURN_MAX、前缀「〔她〕」，紧跟在那条主人发言下面
+ *   提示词里另外明写「她的话只解释上下文，不能当根据」——
+ *   标记只是提醒，真正的闸在提示词那一句。
+ */
+export const HER_TURN_MAX = 120;
+
+/** 只收主人说的话。这是**白名单**，不是黑名单： */
 export const MATERIAL_ROLES = Object.freeze(['user']);
 
 export function isOwnersMessage(m) {
@@ -50,13 +65,34 @@ export function isOwnersMessage(m) {
 
 export function buildSessionMaterial(messages, opts = {}) {
   const o = { ...DIGEST_DEFAULTS, ...opts };
-  const list = (messages ?? [])
-    .filter(isOwnersMessage)
-    .map((m) => String(typeof m === 'string' ? m : (m?.text ?? m?.content ?? '')).replace(/\s+/g, ' ').trim())
-    .filter(Boolean)
-    .slice(-o.maxMessages);
-  if (!list.length) return '';
-  return list.map((t) => t.slice(0, o.maxCharsPerMessage)).join('\n');
+  const norm = (t) => String(t ?? '').replace(/\s+/g, ' ').trim();
+  const turns = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (m == null) continue;
+    const isStr = typeof m === 'string';
+    const role = isStr ? 'user' : String(m.role ?? m.kind ?? '').toLowerCase();
+    const text = norm(isStr ? m : (m?.text ?? m?.content ?? ''));
+    if (!text) continue;
+    if (role === 'model' || role === 'assistant' || role === 'agent' || role === 'bot') {
+      turns.push({ role: 'her', text: text.slice(0, o.herTurnMax ?? HER_TURN_MAX) });
+    } else if (MATERIAL_ROLES.includes(role)) {
+      turns.push({ role: 'user', text });
+    }
+  }
+  // 只留窗口内的尾部，跟原来的 maxMessages 口径一致
+  const tail = turns.slice(-o.maxMessages);
+  if (!tail.some((t) => t.role === 'user')) return '';
+
+  const lines = [];
+  for (const t of tail) {
+    if (t.role === 'user') {
+      lines.push('他：' + t.text.slice(0, o.maxCharsPerMessage));
+    } else {
+      // 她说的话挂在最近一条主人发言下面；没有主人发言打头就当上下文碎句
+      lines.push('  〔她〕' + t.text);
+    }
+  }
+  return lines.join('\n');
 }
 
 /** 模型该看到的提问：不是「总结这段会话」，是「这段时间你看出了什么」。 */
@@ -66,6 +102,11 @@ export function buildDigestPrompt(material, prior = []) {
     : '';
   return [
     '下面是刚过去的一段时间，你说过的和经历过的都在里面。',
+    '',
+    '材料有两类行：「他：」开头的是他说的，「〔她〕」开头的是你自己说的。',
+    '**他自己的话才是证据。你自己的话只能帮你看懂当时是怎么回事，不能拿来自证。**',
+    '如果你发现某条判断，唯一的根据是「我自己说过」，那条就不要写——',
+    '说过什么不算发生过什么。',
     '',
     known,
     material,

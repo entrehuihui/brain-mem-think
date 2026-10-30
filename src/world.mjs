@@ -26,9 +26,6 @@ export const WORLD_DEFAULTS = Object.freeze({
   //   现役判断一律全给（十几条，撑不爆上下文）；
   //   真要收束该在判断库那层去重合并，不该在渲染这层把她记的事吞掉。
   maxHeld: 100,
-  // ★ 2026-10-29 小乔修：给了情境时，因情境取到的条数（不含身份/悬案那种「底色」）。
-  //   原来借道 maxHeld=100，等于没限制，实测渲染 18 行——她已经因为这个字太多修过两轮。
-  recallMax: 5,
   maxRetired: 3,
   maxOpen: 3,
   minWeightToShow: 0.15,
@@ -108,16 +105,7 @@ export function recalledOf(notes, opts = {}) {
       //
       //   「现在」在 toNote 里是单独一个字段 nowNote（推翻它的那条把话写进去）。
       //   取它；没有才退回正文。
-      //   ★ 2026-10-29 小乔补：`nowNote` 也常常不是「她改成了什么」，而是一句
-      //   关于「这条有多重」的元评论——实盘里三条不同的旧观念，被推翻后登的都是
-      //   同一句「这一条重到压过了我原来的底气」。那不是她现在的想法，那是账。
-      //   这种元评论不能当「现在觉得…」念出来，退回正文，宁可她读到自己当初的话。
-      now: (() => {
-        const raw = n.nowNote ?? n.note ?? n.text ?? null;
-        if (!raw) return null;
-        const looksMeta = raw === (n.note ?? n.text) || /重到压过|底气|这一条/.test(String(raw));
-        return looksMeta ? (n.note ?? n.text ?? null) : raw;
-      })(),
+      now: n.nowNote ?? n.note ?? n.text ?? null,
     })),
   };
 }
@@ -152,11 +140,7 @@ export function renderWorld(beliefs, opts = {}) {
   const byWeight = (a, b) => mag(b) - mag(a);
   // ★ 2026-10-28（阶段四·情境检索）：给了 focus 就只取「当下想得起来的几条」。
   //   没给 focus 就退回全量——老调用方（测试、归档渲染）一个字都不用改。
-  // ★ 2026-10-29 小乔修：这里原来直接 `{ maxHeld: o.maxHeld }` 交给 recallFor，
-  //   而 o.maxHeld=100 是「没给情境时的全量上限」。混进检索层以后，
-  //   情境模式也按 100 取 → 整个库倒出来（实测 18 行），情境检索形同虚设。
-  //   两个口径分开：maxHeld 管全量渲染，recallMax 管「此刻想得起来的几条」。
-  const recall = o.focus ? recallFor(o.focus, notes, { recallMax: o.recallMax }) : null;
+  const recall = o.focus ? recallFor(o.focus, notes, { maxHeld: o.maxHeld }) : null;
   const held = recall
     ? recall.held.filter((n) => n.status === 'held').sort(byWeight)
     : notes

@@ -38,6 +38,33 @@ export const OBSERVE_DEFAULTS = Object.freeze({
   recordFailures: true,
   /** 成功的调用只在「她自己出去的」那一轮里记 */
   recordSuccessDuringAct: true,
+  /**
+   * ★ 2026-10-29 大乔加（主人定：成功也是她自己的记忆）：
+   *   上面两条只记失败，等于她的账本里全是败绩——
+   *   于是她只认识「我总在最末一步停下」「我总在动手前停住」，
+   *   从来不认识「我做到过」。一个只记错的脑子，不是人脑。
+   *
+   *   但**不能什么成功都记**：她那套工具一分钟能跑几十次，
+   *   全记下来就是流水账，而流水账正是这个插件要躲的东西。
+   *
+   *   所以只记「做成一件事」的那几种：写字、画画、改文件、跑通、看见东西。
+   *   读目录、查文件、敲命令这类过程性的，成功不记（失败照记）。
+   */
+  recordSuccessTools: Object.freeze([
+    'write', 'edit', // 她真的落下了一笔
+    'read_image', // 她看见了什么
+    'skill', // 她学会/用上了一样本事
+    'qwen-image21-gen', 'krea2-comfyui-run', // 她真的画出了东西
+  ]),
+  /** 成功那一条也要有人味：不写「我用write做到了」，写「我写下了」 */
+  successText: Object.freeze({
+    write: '我写下了',
+    edit: '我改好了',
+    read_image: '我看清楚了',
+    skill: '我学会了一样东西',
+    'qwen-image21-gen': '我画出来了',
+    'krea2-comfyui-run': '我画出来了',
+  }),
   /** 一次最多记多少条（防一次 turn 里 300 个调用把账本淹掉） */
   maxPerBatch: 40,
 });
@@ -81,17 +108,26 @@ export function runsFromSessionEvents(events, { sinceSeq = 0 } = {}) {
  */
 export function eventsFromRuns(runs, { duringAct = false, at = Date.now(), opts = {} } = {}) {
   const o = { ...OBSERVE_DEFAULTS, ...opts };
+  const successTools = new Set(o.recordSuccessTools ?? []);
+  const successText = o.successText ?? {};
   const out = [];
   for (const r of Array.isArray(runs) ? runs : []) {
     if (!r) continue;
-    const interesting = (o.recordFailures && !r.ok) || (o.recordSuccessDuringAct && duringAct);
+    const tool = String(r.tool ?? 'unknown');
+    // 失败照记；成功分两种：
+    //   ① 她自己出去那一趟 —— 全记（那是「想弄明白」的闭环）
+    //   ② 平常 —— 只记「做成一件事」的那几种（主人定的：成功也是她的记忆）
+    const interesting = (o.recordFailures && !r.ok)
+      || (o.recordSuccessDuringAct && duringAct)
+      || (r.ok && successTools.has(tool));
     if (!interesting) continue;
+    const ownLine = r.ok ? successText[tool] : null;
     out.push(makeEvent({
       at: Number(r.at) || at,
       actor: '我',
-      action: String(r.tool ?? 'unknown'),
+      action: tool,
       polarity: r.ok ? 1 : -1,
-      text: r.ok ? `我用${r.tool}做到了` : `我用${r.tool}没成`,
+      text: r.ok ? (ownLine ?? `我用${tool}做到了`) : `我用${tool}没成`,
       themeKey: null,
       source: duringAct ? 'act' : 'tool',
       weight: 0,

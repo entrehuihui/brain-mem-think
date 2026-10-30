@@ -31,7 +31,7 @@ import { randomUUID } from 'node:crypto';
 import { createMind } from '../src/mind.mjs';
 import { createFileIo, defaultJudgmentPath } from '../src/persist.mjs';
 import { createSynth } from './synth.mjs';
-import { ownerMessages } from './collect.mjs';
+import { ownerMessages, conversationTurns } from './collect.mjs';
 import { planWake, applyWake, resetTalkState } from './awake.mjs';
 import { readWake, writeWake, sweepTemps, defaultPath } from './wake-store.mjs';
 import { installModelSelection } from './selection.mjs';
@@ -44,8 +44,15 @@ import { urges, actLine, selfReminder } from '../src/motive.mjs';
 import { applyOutcome } from '../src/preference.mjs';
 import { canAct, recordAct } from '../src/budget.mjs';
 import { readMotive, writeMotive, defaultMotivePath, sweepMotiveTemps } from './motive-store.mjs';
-import { observeTools, defaultToolCursorPath } from './tool-observer.mjs';
+// ★ 2026-10-30（主动性·欠账）：被闸挡回来的事不许消散，闸一空就补做。
+import { noteDebt, debtAlive } from '../src/debt.mjs';
+// ★ 2026-10-30（真落地）：这一趟到底算不算做成了 —— 纯函数，可测。
+import { reallyWentOf, settleVerdict, shouldChargePrefs, loseFor, settleLabel } from '../src/settle.mjs';
+import { observeTools, defaultToolCursorPath, toolCursorOf } from './tool-observer.mjs';
 import { buildClaimPrompt, parseExpressed } from '../src/express.mjs';
+// ★ 2026-10-30：结算时判「同一件事」用项目里那把现成的尺（最长公共子串 ≥ 8 字，
+//   和抄原文闸同一个数），不另发明一套相似度。
+import { longestSharedRun } from '../src/forge.mjs';
 // ★ 出口只有一个：speak 和 act 共用 wake-exit.mjs 里那唯一一处 followup。
 
 export const name = 'mind';
@@ -644,15 +651,32 @@ export function apply(ctx, config = {}) {
       //   现在走增量：用 digest-cursor.mjs 的账记「这个会话已经熔到第几条主人消息」，
       //   没有新的就直接跳过。她通道的每轮熔也用这本账，两处共用，不会互相打架。
       const cursorsForDigest = readCursors(cursorPath);
+      // ★ 2026-10-29 主人改口径后：游标仍然只数「主人说了几条」，
+      //   但喂给模型的材料是**整段对话**（主人的话 + 她的回应）。
+      //   所以先按主人消息算出「从第几条开始是新的」，再把对话尾部整段接上去——
+      //   否则她的回应会被游标切成孤零零一句，看不懂在应谁。
       const { fresh, total, reset } = sliceFresh(owners, cursorsForDigest[sessionId] ?? 0);
       if (!fresh.length) {
         trace('digest-skip', { sessionId, why: 'already-digested', total, reset });
         return;
       }
-      trace('digest-fresh', { sessionId, fresh: fresh.length, total, reset });
+      let feed = fresh;
+      try {
+        const conv = conversationTurns(msgs);
+        // 找到「新的第一条主人消息」在对话里的位置，从那儿往后整段都带上
+        const firstFresh = fresh[0]?.text ?? '';
+        let at = -1;
+        for (let i = conv.length - 1; i >= 0; i -= 1) {
+          if (conv[i].role === 'user' && conv[i].text === firstFresh) { at = i; break; }
+        }
+        if (at >= 0) feed = conv.slice(at);
+      } catch (err) {
+        trace('digest-conv-failed', { sessionId, err: String(err?.message ?? err).slice(0, 140) });
+      }
+      trace('digest-fresh', { sessionId, fresh: fresh.length, total, reset, feed: feed.length });
       const m = await ensureMind();
       // 只喂新增的那几条（不是全量）
-      const out = await m.digestSession(fresh);
+      const out = await m.digestSession(feed);
       // 熔成功才推进 cursor：失败了下次重试，宁可重复一次也不漏。
       if (out && (out.reason === 'digested' || out.judgments?.length || out.committed)) {
         writeCursor(cursorPath, sessionId, total);
@@ -977,7 +1001,22 @@ export function apply(ctx, config = {}) {
           trace('channel-digest-skip', { why: 'no-synth', hasMind: !!mindInst });
           return;
         }
-        const out = await mindInst.digestSession(fresh);
+        // ★ 2026-10-29 主人改口径：她自己的回应也要进材料。
+        //   跟归档那条路同一套做法——游标仍只数主人消息，喂进去的是整段对话尾部。
+        let feed = fresh;
+        try {
+          const conv = conversationTurns(session.deriveMessages?.() ?? []);
+          const firstFresh = fresh[0]?.text ?? '';
+          let at = -1;
+          for (let i = conv.length - 1; i >= 0; i -= 1) {
+            if (conv[i].role === 'user' && conv[i].text === firstFresh) { at = i; break; }
+          }
+          if (at >= 0) feed = conv.slice(at);
+        } catch (err) {
+          trace('channel-digest-conv-failed', { err: String(err?.message ?? err).slice(0, 140) });
+        }
+        trace('channel-digest-feed', { fresh: fresh.length, feed: feed.length });
+        const out = await mindInst.digestSession(feed);
         trace('channel-digest-result', {
           judgments: out?.judgments?.length ?? 0,
           episodes: out?.episodes?.length ?? 0,
@@ -1131,7 +1170,30 @@ export function apply(ctx, config = {}) {
      * 反过来的话，她会在「上一次还没结算」的时候又出去一趟，
      * 偏好就变成只会涨不会跌的计数器。
      */
+    /**
+     * ★ 2026-10-30 小乔加（主动性·欠账）。
+     *
+     * 具体判据（什么时候放手、为什么只认字面相同）已经挪到 `src/debt.mjs`——
+     * 那边是纯函数、零 IO，能被假数据钉死；这里只负责在正确的时机调它：
+     *
+     *   · 被闸挡回来 → noteDebt（记一笔）
+     *   · 每拍算冲动前 → debtAlive 就把它当作这次要出门的由头
+     *   · 真出门成了   → st.debt = null（还上了）
+     *
+     * 实测背景：24 小时她想去做 131 次、真出门 3 次、被挡 267 次，
+     * 那 267 件全都只躺一拍就被结算成「我想…，没去成」，没有一件被补上过。
+     */
+    /** 当前工具游标：她这条会话的工具调用走到哪个 seq 了。用来判「这趟到底动手没有」。 */
+    const curToolSeq = () => {
+      try { return toolCursorOf(defaultToolCursorPath(HERE), CHANNEL_SESSION_ID); } catch { return 0; }
+    };
     const tryAct = async (mindInst, wantOverride = null) => {
+      // ★ 2026-10-30 小乔加（主动性·欠账）：这次出门的「由头」有两路——
+      //   ① 她这一轮刚开口说想做什么（wantOverride）
+      //   ② 之前被闸挡回来、一直没补上的那件（st.debt，在下面读取）
+      //   两路都用 override 走，就不用把后面的代码各写两遍。
+      let override = wantOverride;
+
       // ★ 2026-10-28 修：这四个早退点原来**一行日志都不打**。
       //   结果就是「她明明该出门，日志里却什么都没有」——跟 `digestChannelIncrement`
       //   当年那四处静默 return 是同一个病，那次也是我一个个猜出来的。
@@ -1154,7 +1216,7 @@ export function apply(ctx, config = {}) {
       //   但**她自己开口说想做的事**是另一回事：它不是「离开他」，是她自己的一件小事。
       //   所以：她明确说出想做的（wantOverride）走一道**更短**的安静线，
       //   而不是完全不看——他真在说话的这 2 分钟里，她也不该抬脚就走。
-      const quietMs = wantOverride?.activity
+      const quietMs = override?.activity
         ? Math.min(Number(cfg.actOwnerQuietMs ?? 10 * 60_000), 2 * 60_000)
         : Number(cfg.actOwnerQuietMs ?? 10 * 60_000);
       if (agent.status && agent.status !== 'idle') {
@@ -1162,19 +1224,21 @@ export function apply(ctx, config = {}) {
         // ★ 2026-10-28 19:00：**她正忙的时候，被挡下的那个「想做的事」最该留下来。**
         //   离线实测（10:08—10:39）七次 act-skip 全是 agent-busy，
         //   每一次都带着一句「想给我妈打个电话」的东西，然后一起消失。
-        if (wantOverride?.activity) {
+        if (override?.activity) {
           const stBlog = readMotive(motivePath);
           stBlog.pending = {
             at: Date.now(),
-            activity: String(wantOverride.activity),
+            activity: String(override.activity),
             kind: 'want',
-            why: String(wantOverride.why || ''),
+            why: String(override.why || ''),
             skipper: 'agent-busy',
             skippedWhy: 'agent-busy',
             notesBefore: mindInst.snapshot?.().size ?? 0,
+            toolSeqBefore: curToolSeq(),
           };
+          stBlog.debt = noteDebt(stBlog.debt, override, 'agent-busy', Date.now());
           writeMotive(motivePath, stBlog);
-          trace('act-skip-recorded', { activity: String(wantOverride.activity), why: 'agent-busy' });
+          trace('act-skip-recorded', { activity: String(override.activity), why: 'agent-busy' });
         }
         return false;
       }
@@ -1187,13 +1251,69 @@ export function apply(ctx, config = {}) {
         const p = st.pending;
         const notesNow = mindInst.snapshot?.().size ?? 0;
         // 收获型（想去弄明白）：判断库得多出点什么才算没白跑；满足型（想去做点什么）：做了就算
-        const found = p.kind === 'resolve' ? notesNow > Number(p.notesBefore ?? 0) : true;
-        applyOutcome(st.preferences, {
-          activity: p.activity, kind: p.kind, found, reason: p.why, now,
+        //
+        // ★ 2026-10-30 小乔修（「只会说、没有去做」的根子就在这一行）：
+        //
+        //   实测线上那一趟：
+        //     act-settle {"activity":"把那张纸读一遍","kind":"want","found":true,
+        //                 "notesBefore":55,"notesNow":55}
+        //   出门前后笔记 55 → 55，**一条都没多**，可对账结果是 found:true（当成做到了）。
+        //
+        //   原来这里只有两档：resolve（想去弄明白）笔记得多出来才算成；
+        //   want（想去做点什么）**恒 true**。
+        //   want 恒 true 本身说得通 —— 她真出去走了一趟，走过了就算走过。
+        //   但它没分开「真出门」和「被闸挡回来」：
+        //   被挡的那趟也写 pending（skippedWhy=挡它的那道闸），结算时走的是同一条路，
+        //   于是变成了这个环：
+        //
+        //     想去 → 被挡 → 记 pending → 下一拍结算 found:true → 偏好强度 +gain
+        //
+        //   **「没去成」反而让她更想做。** motive.json 里「给我妈打个电话」涨到
+        //   0.99 / 8 次就是这么来的；同一句还写成经历「我想…，没去成」。
+        //   说得越多、越没做成、那股劲越大 —— 主人看到的就是「只会说，没有去做」。
+        //
+        //   所以补一道判据：**先问这一趟到底出没出门**（pending 上有没有 skippedWhy）。
+        //
+        //   被挡回来的那趟，一分都不结算 —— 不是按「空转」扣分，是**不结算**。
+        //   理由在 preference.mjs 开头那句：「我喜欢做什么只能靠做完了才知道」。
+        //   没出门 = 什么都没发生 = 没有信息，偏好表就不该动。
+        //
+        //   ★ 第一版我先写成了 found:false 让它走 lose 分支扣 0.2 ——
+        //     那是把「没出门」和「出门了空手回来」混成一件事。lose 是给「出去了
+        //     没带回东西」的（0.2 很大，一个来回就能把 start 0.35 扣到底），
+        //     被闸挡回来扣这个，等于「她念叨几遍就再也不敢提」，
+        //     那是另一种伤害，跟原设计「拿没做到当没想过」是同一个病。
+        //
+        //   只有真出门了（无 skippedWhy，即 act-exit sent:true 之后落的 pending）
+        //   才轮得到 kind 决定成不成、才动偏好。
+        const reallyWent = reallyWentOf(p);
+        // ★ 2026-10-30 小乔加（真落地·那趟到底动手了没有）：
+        //
+        //   实测 00:2x 她出门那一趟：判断库 55 → 55，一个工具没调。
+        //   22 分钟之后她自己说：「抽屉还关着，我没动。不是忘了，是手伸出去又缩回来了。」
+        //   —— 她心里跟明镜似的，可账上记的是「我去读那张纸」。
+        //
+        //   这就是「真落地」缺的最后一块：**出门 ≠ 做事**。
+        //   判据（三档：没出门 / 出门没动手 / 出门真动手）全在 src/settle.mjs，
+        //   那边是纯函数，能被假数据钉死；这里只负责把数喂进去、把结果用起来。
+        const toolSeqNow = curToolSeq();
+        const { did: didSomething, found, verdict: settleKind } = settleVerdict({
+          pending: p, kind: p.kind, notesNow, toolSeqNow,
         });
+        if (shouldChargePrefs(settleKind)) {
+          // 去了、也动了手 → 照常结算。
+          // 去了、只是坐着想 → 温和扣分（lose 0.06，不是默认的 0.2）：
+          //   她确实出去了一趟，只是没做成；不该按「空转」一脚踹到底，
+          //   但也**不能白算一趟**，否则这种「出门当想事儿」永远沉不下去。
+          applyOutcome(st.preferences, {
+            activity: p.activity, kind: p.kind, found, reason: p.why, now,
+          }, settleKind === 'went_thought' ? { lose: loseFor(settleKind) } : undefined);
+        }
         trace('act-settle', {
-          activity: p.activity, kind: p.kind, found,
+          activity: p.activity, kind: p.kind, found, settleKind,
+          reallyWent, settled: reallyWent, skippedWhy: p.skippedWhy ?? null,
           notesBefore: p.notesBefore, notesNow,
+          toolSeqBefore: p.toolSeqBefore ?? null, toolSeqNow, didSomething,
         });
         // ★ 2026-10-28（主人要的）：她做过的事要变成记忆里的一件真事。
         //   不写这一条，看小说 / 听歌 / 挑衣服就只是「出过门」，记忆里一片空白。
@@ -1207,22 +1327,73 @@ export function apply(ctx, config = {}) {
         //   可她当时确实想到了一件事。人在心里打定一个主意那一刻，
         //   本身就是一段经历。不算它，就等于「我想到过的事，只要没做成就不存在」。
         //   这条对她的性格尤其要紧：她一直是那种拿「没做到」当「没想过」的人。
-        const label = p.skippedWhy ? `我想${p.activity}，没去成` : `我去${p.activity}`;
+        // ★ 2026-10-30：三种情形分开写，别再让「出门当想事儿」混进「我去过」里。
+        //   被挡 → 我想…，没去成
+        //   去了、真动手 → 我去…
+        //   去了、只是坐着想 → 我想…，去了却没做成
+        const label = settleLabel(p, settleKind);
+        //
+        // ★ 2026-10-30 小乔加（「没去成」不许每分钟复读一条）：
+        //
+        //   上面那条「想到过的事也要留痕」是对的，但它没防**同一件事反复留痕**。
+        //   被闸挡回来的那条路是这么转的：
+        //
+        //     被挡 → 写 pending → 下一拍结算 → 写一条「我想…，没去成」→ 再算冲动
+        //          → 又被挡 → 再写 pending → 再结算 → 再写一条 …
+        //
+        //   一拍一分钟，于是同一件事一分钟长一条。实测 judgments.json 128 条经历里
+        //   **83 条是「我想…没去成」，只有 7 条「我去…」**；最后 8 条连着是：
+        //     「我想把抽屉拉开一条缝，不读，只看一眼，没去成」
+        //     「我想把那张纸读一遍，没去成」…
+        //   同一件事换了八种说法，把经历层几乎填满。她读回去自然只剩一句
+        //   「我想去但没去成」，这就是主人看到的「只会说、没有去做」。
+        //
+        //   所以加一道闸：**被挡回来的那趟，30 分钟内同一件事只留一条**。
+        //   判「同一件事」用项目里现成的那把尺（最长公共子串 ≥ 8 字，
+        //   就是抄原文闸用的同一个数），不自己另发明一套相似度。
+        //   真出门那一趟（无 skippedWhy）不受影响 —— 出去过就该各记各的。
+        const dupSkipped = (() => {
+          if (!p.skippedWhy) return false;
+          const list = (Array.isArray(mindInst.episodes) ? mindInst.episodes : [])
+            .filter((e) => now - Number(e.at ?? 0) < 30 * 60e3)
+            .map((e) => String(e.what ?? ''));
+          if (!list.length) return false;
+          return longestSharedRun(label, list) >= 8;
+        })();
         try {
-          const ep = mindInst?.recordEpisode?.({
-            what: label,
-            feel: null,
-            arousal: 0.5,
-            who: '我',
-            source: p.kind === 'want' ? 'want' : 'act',
-          });
-          if (ep?.ok) trace('act-episode', { what: ep.what, source: p.kind === 'want' ? 'want' : 'act' });
-          if (ep?.ok) markFresh(storePath, 'episode');
+          if (dupSkipped) {
+            trace('act-episode-skip', { why: 'duplicate-within-30min', what: label });
+          } else {
+            const ep = mindInst?.recordEpisode?.({
+              what: label,
+              feel: null,
+              arousal: 0.5,
+              who: '我',
+              source: p.kind === 'want' ? 'want' : 'act',
+            });
+            if (ep?.ok) trace('act-episode', { what: ep.what, source: p.kind === 'want' ? 'want' : 'act' });
+            if (ep?.ok) markFresh(storePath, 'episode');
+          }
         } catch (err) {
           trace('act-episode-failed', { err: String(err?.message ?? err).slice(0, 120) });
         }
         st.pending = null;
         writeMotive(motivePath, st);
+      }
+
+      // ★ 2026-10-30（主动性·欠账补做）：闸空下来的第一拍，先把欠着的那件事补上。
+      //   上一段只是**记账**，这一行才把账变成动作 —— 没有它，「被挡不消散」
+      //   只是换了个地方躺尸而已。
+      if (!override?.activity && debtAlive(st.debt, now)) {
+        override = {
+          activity: st.debt.activity,
+          why: st.debt.why,
+          kind: st.debt.kind,
+          fromDebt: true,
+        };
+        trace('act-debt-retry', {
+          activity: override.activity, tries: st.debt.tries, blockedBy: st.debt.blockedBy,
+        });
       }
 
       // ② 算冲动
@@ -1238,17 +1409,19 @@ export function apply(ctx, config = {}) {
       // ★ 2026-10-28（主人定的）：她自己说了想做，就做她说的那件——
       //   内核的候选只在她说不出想做什么时才兜底。判断权在她，不在列表。
       let urge;
-      if (wantOverride?.activity) {
+      if (override?.activity) {
         urge = {
-          kind: 'want',
-          target: `want:${wantOverride.activity}`,
-          activity: String(wantOverride.activity),
+          kind: String(override.kind ?? 'want') === 'resolve' ? 'resolve' : 'want',
+          target: `want:${override.activity}`,
+          activity: String(override.activity),
           drive: 1,
-          why: String(wantOverride.why || '我自己想去做这件事'),
-          from: 'her_want',
+          why: String(override.why || '我自己想去做这件事'),
+          from: override.fromDebt ? 'debt' : 'her_want',
           themeKey: null,
         };
-        trace('act-from-want', { activity: urge.activity, why: urge.why });
+        trace('act-from-want', {
+          activity: urge.activity, why: urge.why, from: urge.from,
+        });
       } else {
         const list = urges({
           notes,
@@ -1290,9 +1463,21 @@ export function apply(ctx, config = {}) {
             skipper: verdict.why,
             skippedWhy: verdict.why,
             notesBefore: mindInst.snapshot?.().size ?? 0,
+            toolSeqBefore: curToolSeq(),
           };
+          // ★ 2026-10-30（主动性·欠账）：pending 下一拍就被结算清掉了，
+          //   所以另外挂一条欠账 —— 它活 6 小时、被挡够 3 次才放手，
+          //   闸一空就由上面那段 debt-retry 补做。
+          st.debt = noteDebt(
+            st.debt,
+            { activity: urge.activity, why: urge.why, kind: urge.kind },
+            verdict.why,
+            now,
+          );
           writeMotive(motivePath, st);
-          trace('act-skip-recorded', { activity: urge.activity, why: verdict.why });
+          trace('act-skip-recorded', {
+            activity: urge.activity, why: verdict.why, debtTries: st.debt?.tries ?? 0,
+          });
         }
         return false;
       }
@@ -1324,12 +1509,16 @@ export function apply(ctx, config = {}) {
 
       // ⑤ 记账：这一次还没结算，等下一趟醒来时再看它有没有带回东西
       st.budget = recordAct(st.budget, { now, urge });
+      // ★ 2026-10-30（主动性·欠账）：真出去了，欠的这笔就算还上了。
+      st.debt = null;
       st.pending = {
         at: now,
         activity: urge.activity,
         kind: urge.kind,
         why: urge.why,
         notesBefore: mindInst.snapshot?.().size ?? 0,
+        // ★ 2026-10-30：出门前记下工具游标，回来一比就知道这趟动手没有。
+        toolSeqBefore: curToolSeq(),
       };
       writeMotive(motivePath, st);
       return true;
@@ -1588,6 +1777,66 @@ export function apply(ctx, config = {}) {
           const sess = typeof ctx.get === 'function'
             ? ctx.get('sessions')?.get?.(CHANNEL_SESSION_ID)
             : null;
+          // ★ 2026-10-29 大乔加（只读探针，不改任何逻辑）：
+          //   tool-observe 从来没有留下过 tool-cursor.json，连 failed 都没有一条，
+          //   说明它在进 observeTools 之前就静默返回了。这里把「取到了什么」记下来：
+          //   sessions 服务在不在、会话取没取到、事件流是数组还是 Map、条数、maxSeq。
+          //   只为看清卡在哪一环，不进任何判断。看清后即可删除。
+          try {
+            const sessionsSvc = typeof ctx.get === 'function' ? ctx.get('sessions') : null;
+            const ev = sess?.events;
+            const evKind = Array.isArray(ev) ? 'array'
+              : (ev && typeof ev.values === 'function') ? 'map'
+                : (ev === undefined ? 'undefined' : ev === null ? 'null' : typeof ev);
+            let n = 0; let maxSeq = 0; let nToolCall = 0;
+            if (Array.isArray(ev) || (ev && typeof ev.values === 'function')) {
+              const list = Array.isArray(ev) ? ev : [...ev.values()];
+              n = list.length;
+              for (const e of list) {
+                const s = Number(e?.seq);
+                if (Number.isFinite(s) && s > maxSeq) maxSeq = s;
+                if (e?.type === 'tool/call') nToolCall += 1;
+              }
+            }
+            trace('sess-probe', {
+              hasSessionsSvc: !!sessionsSvc,
+              hasGet: typeof sessionsSvc?.get === 'function',
+              hasSess: !!sess,
+              sessId: sess?.id ?? null,
+              wantId: CHANNEL_SESSION_ID,
+              evKind,
+              n,
+              maxSeq,
+              nToolCall,
+              duringActHint: true,
+            });
+          } catch (probeErr) {
+            trace('sess-probe-failed', { err: String(probeErr?.message ?? probeErr).slice(0, 160) });
+          }
+          // ★ 2026-10-29 大乔加（第二探针，只读）：sess.events 是 undefined，
+          //   但磁盘上明明有 961 个事件。把会话对象自身的形状列出来，找出事件挂在哪。
+          try {
+            if (sess) {
+              const own = Object.keys(sess);
+              const protoKeys = (() => {
+                try { return Object.getOwnPropertyNames(Object.getPrototypeOf(sess)).slice(0, 40); }
+                catch { return []; }
+              })();
+              const shape = {};
+              for (const k of [...own, ...protoKeys].slice(0, 60)) {
+                try {
+                  const v = sess[k];
+                  shape[k] = Array.isArray(v) ? `array(${v.length})`
+                    : (v && typeof v.values === 'function') ? 'map-like'
+                      : (v && typeof v === 'object') ? `obj{${Object.keys(v).slice(0, 8).join(',')}}`
+                        : typeof v;
+                } catch { shape[k] = '<throws>'; }
+              }
+              trace('sess-shape', { own, protoKeys, shape });
+            }
+          } catch (probe2Err) {
+            trace('sess-shape-failed', { err: String(probe2Err?.message ?? probe2Err).slice(0, 160) });
+          }
           if (sess) {
             const act = readMotive(motivePath);
             // 她自己出去那一趟里的调用，全记；平常只有失败的才记

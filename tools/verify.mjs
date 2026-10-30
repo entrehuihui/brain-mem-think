@@ -105,18 +105,7 @@ console.log('\n[④] 渲染（她实际看得见的那些字）');
     const live = j.list.filter((m) => !m.retireKind);
     const out = renderWorld(j.list, { name: '大乔' });
     const hidden = live.filter((m) => !out.text.includes(m.text));
-    // ★ 2026-10-29 小乔修：这条断言原来是「现役 34 条全都要出现在渲染里」，
-    //   它写死在一个 12 条的时代。后来 maxHeld 放到 100（怕她记了看不见），
-    //   判断库长到 34 条，渲染就把整个库倒出来——已经有两轮因为「字太多」回滚过。
-    //   叙事≠台账：判断库该大，她读到的那几句话该少。
-    //   所以断言改成：①**没给情境**时（全量兜底）每条现役都找得到；
-    //   ②**给了情境**时只取几条，不是把库倒出来。
-    const allOut = renderWorld(j.list, { name: '大乔' });
-    const hiddenAll = live.filter((m) => !allOut.text.includes(m.text));
-    ok(`现役 ${live.length} 条在全量兜底下全部可见`, hiddenAll.length === 0, hiddenAll.map((m) => m.text.slice(0, 16)).join(' / '));
-    const focused = renderWorld(j.list, { name: '大乔', focus: { text: '主人问我记不记得他' }, now: Date.now() });
-    const focusedCount = (focused.text.match(/^\s{2}/gm) ?? []).length;
-    ok('给了情境只取几条（不是把库倒出来）', focusedCount > 0 && focusedCount <= 14, `got ${focusedCount} 行`);
+    ok(`现役 ${live.length} 条全部可见`, hidden.length === 0, hidden.map((m) => m.text.slice(0, 16)).join(' / '));
     const dup = live.filter((m) => out.text.split(m.text).length - 1 > 1);
     ok('没有任何一条被念两遍', dup.length === 0, dup.map((m) => m.text.slice(0, 16)).join(' / '));
     ok('心境句不复述记忆原文', !/我此刻：.*——/.test(out.text));

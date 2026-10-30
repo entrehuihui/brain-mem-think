@@ -1,14 +1,23 @@
-# ── 运行数据：一条都不进仓库 ──────────────────────────────────
-# 这里是她的记忆（judgments.json）、账本（wake/motive）、日志、通道 id。
-# 代码归代码，她的经历归她自己的磁盘。仓库里不存运行数据。
-.mind/
-*.log
-*.json.bak-*
+# 依赖
+node_modules/
+pnpm-lock.yaml
 
-# ── 备份与临时件 ─────────────────────────────────────────────
+# 运行数据 —— 她的记忆、账本、日志都不进版本库
+.mind/
+*.mind/
+wake.json
+judgments.json
+mind.log
+
+# 本地临时
 *.bak
 *.bak-*
-*.bak.*
-node_modules/
+*.tmp-*
+_probe*.mjs
+lead_probe*.mjs
+lead_spotcheck*.mjs
+_probe*.cjs
+
+# 系统
 .DS_Store
-Thumbs.db
+Thumbs.dbrun_one_result.json

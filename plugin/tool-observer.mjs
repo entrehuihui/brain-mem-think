@@ -46,14 +46,41 @@ function writeAll(path, sessions) {
   } catch { return false; }
 }
 
-/** 会话事件流可能是数组，也可能是个 Map（宿主两种形态都出现过）。 */
+/**
+ * 会话事件流可能是数组，也可能是个 Map（宿主两种形态都出现过）。
+ *
+ * ★ 2026-10-29 大乔修（这条线从装上起就没通过一次）：
+ *
+ *   原来只读 `session?.events`。实测宿主 DSH 的会话对象上**根本没有 events 字段**
+ *   （sess-probe: evKind=undefined），而事件全在 `session.log`／`session.eventsSnapshot`，
+ *   并且自带 `snapshotEvents()` 方法——磁盘上 963 个事件、87 次 tool/call 一条没丢，
+ *   但 eventsOf 每次返回 []，于是 observeTools 立刻 `if (!all.length) return`，
+ *   连 tool-cursor.json 都没生成过，日志里连 failed 都没有一条。
+ *
+ *   现在按「现成方法 → 快照字段 → 原字段」三级退，哪一级先给得出就先用哪一级。
+ *   任何一级抛出或给空，就往下退——绝不再一声不吭地返回空。
+ */
 function eventsOf(session) {
+  if (!session) return [];
+  // ① 宿主现成的取法（最稳：它自己知道事件该怎么摊）
   try {
-    const ev = session?.events;
-    if (Array.isArray(ev)) return ev;
-    if (ev && typeof ev.values === 'function') return [...ev.values()];
-    return [];
-  } catch { return []; }
+    if (typeof session.snapshotEvents === 'function') {
+      const s = session.snapshotEvents();
+      if (Array.isArray(s) && s.length) return s;
+    }
+  } catch { /* 退下一级 */ }
+  // ② 快照字段 / 原始日志字段（实测这两个都是 963 条）
+  for (const key of ['eventsSnapshot', 'log', 'events']) {
+    try {
+      const ev = session[key];
+      if (Array.isArray(ev) && ev.length) return ev;
+      if (ev && typeof ev.values === 'function') {
+        const arr = [...ev.values()];
+        if (arr.length) return arr;
+      }
+    } catch { /* 退下一级 */ }
+  }
+  return [];
 }
 
 /**
@@ -107,4 +134,20 @@ export function observeTools({ session, mind, cursorPath, sessionId, duringAct =
 
 export function defaultToolCursorPath(pluginRoot) {
   return join(pluginRoot, '.mind', 'tool-cursor.json');
+}
+
+/**
+ * ★ 2026-10-30 小乔加：只读地问一句「这个会话的工具游标走到哪了」。
+ *
+ * 用处只有一个：她出门那一趟，**到底有没有真的调过工具**。
+ *
+ * 为什么非要知道这个：实测她出门回来，判断库 55 → 55 条没变，
+ * 而那一趟一个工具都没调——她只是坐那儿想了一路，然后写进经历「我去读那张纸」。
+ * 记忆里于是长出一片「我去过」，实际一次手都没动。
+ *
+ * 这笔账从这里读，配合 pending 上记下的 seq，就知道这趟是「做了」还是「想了」。
+ */
+export function toolCursorOf(cursorPath, sessionId) {
+  const all = readAll(cursorPath);
+  return Number(all?.[String(sessionId ?? '')] ?? 0) || 0;
 }

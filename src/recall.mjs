@@ -25,14 +25,7 @@
 import { weightWithSting } from './sting.mjs';
 
 export const RECALL_DEFAULTS = Object.freeze({
-  // ★ 2026-10-29 小乔修：这两条口径原来互相打架。
-  //   recallFor 返回的 held = must(底色) + picked，调用方传的是 maxHeld:100，
-  //   于是 ①「底色永远留」把 7 条身份全塞进去，② 27 条 episodic 又挤进上限，
-  //   实测渲染 18 行——情境检索等于没有。
-  //   分开：底色照样全留（那是她不是她的问题），但**因为情境取到的**另有硬上限，
-  //   总数 = 底色 + 至多 5 条。否则「当下想得起来的几条」永远落不了地。
-  recallMax: 5,        // 因情境取到的：3~5，这里是上限（不含底色）
-  maxHeld: 5,          // 老口径：没传 recallMax 时用它当上限
+  maxHeld: 5,          // 按情境取的现役条数（3~5，这里是上限）
   minScore: 0.2,       // 低于这条线的不算「想起」（Dice 系数）
   textWeight: 0.55,    // 文本重合占多少
   themeBonus: 0.35,    // 主题键命中（最硬的一条线索）
@@ -95,9 +88,8 @@ export function recallFor(focus, notes, opts = {}) {
 
   const picked = [];
   const pickedIds = new Set(must.map((n) => n.id));
-  const cap = Math.max(1, Number(o.recallMax ?? o.maxHeld ?? 5));
   for (const s of scored) {
-    if (picked.length >= cap) break;
+    if (picked.length >= o.maxHeld) break;
     if (pickedIds.has(s.note.id)) continue;
     // ③ 必须有一条硬线索才取：文本够像、主题命中、或对象命中。
     //    不再拿「底子厚」当理由——那就变成整库按份量排前五，跟情境没关系了。
