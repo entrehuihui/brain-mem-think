@@ -78,6 +78,13 @@ const SUITE = [
   // ★ 2026-11-02 我加的：被问住的时候能回去查一次（只带回重述，8 字闸管着），
   //   以及「我亲手看过」只认 read/run/fetch/look——说话和想事都不算证据。
   { key: 'x', file: 'tests/smoke_lookup_saw.mjs', title: '回去查一次 + 我亲手看过（不存原文·说话不算证据）' },
+  // ★ 2026-11-02 小乔加（两条）：
+  //   y  孤岛守卫 —— `src/` 里每个模块都必须在 plugin 层**真的有人叫**。
+  //      lookup/saw 写完、判据全绿、`grep plugin/` 却一个都中不了，就是这条没装的下场。
+  //   z  悬念不被消解 —— 摆出去的「拿不准」，下一轮不许被她自己（模型）顺手裁掉。
+  //      摆得再克制，只要下一轮没收住，这一段等于当场作废。
+  { key: 'y', file: 'tests/smoke_no_island.mjs', title: '孤岛守卫（src 每个模块都得在 plugin 层有着落）' },
+  { key: 'z', file: 'tests/smoke_doubt_survives.mjs', title: '悬念不被消解（两边都还在·要到新证据才许收口）' },
   { key: 'r1', file: 'acceptance/redteam/r1_paraphrase_alive.mjs', title: '对抗·换皮冒充会想多' },
   { key: 'r2', file: 'acceptance/redteam/r2_correction_driven.mjs', title: '对抗·被纠正冒充会改自己' },
   { key: 'r3', file: 'acceptance/redteam/r3_curiosity_loop.mjs', title: '对抗·死循环冒充会追问' },

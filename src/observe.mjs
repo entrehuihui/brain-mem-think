@@ -70,14 +70,30 @@ export const OBSERVE_DEFAULTS = Object.freeze({
 });
 
 /** 从宿主的会话事件流里，把工具调用配成「跑了什么、成没成」。 */
-export function runsFromSessionEvents(events, { sinceSeq = 0 } = {}) {
+export function runsFromSessionEvents(events, opts = {}) {
+  const { sinceSeq = 0, knownCalls = null } = opts;
   const list = Array.isArray(events) ? events : [];
   const calls = new Map();
+  // ★ 2026-11-02 小乔修（跨批次丢掉工具名）：
+  //
+  //   上面那段是原始逻辑，保留不动。它有个缺口：
+  //   `eventsOf()` 是三级退（snapshotEvents → eventsSnapshot/log → events），
+  //   某一级只给得出**片段**时，`tool/call` 在片段外、`tool/result` 在片段内。
+  //   于是 `calls.get(id)` 落空 → `tool:'unknown'` → 最终写出
+  //   「我用unknown做到了」—— 2026-10-29「skill 一次没记进来」就是这条线。
+  //
+  //   修法不是别推游标，是**把名字教给它**：调用方能传上一跳见过的
+  //   callId → {tool, at, seq} 进来，缺的那一半从这儿补。
+  //   两路都补不上才认 unknown —— 那是真的不知道，不猜。
+  const index = knownCalls instanceof Map ? knownCalls : null;
   for (const e of list) {
     if (e?.type !== 'tool/call') continue;
     const id = e.data?.callId;
     if (!id) continue;
     calls.set(id, { tool: String(e.data?.name ?? 'unknown'), at: Number(e.at) || 0, seq: Number(e.seq) || 0 });
+  }
+  if (index) {
+    for (const [id, v] of index) if (v && !calls.has(id)) calls.set(id, v);
   }
   const runs = [];
   for (const e of list) {

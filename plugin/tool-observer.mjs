@@ -22,8 +22,64 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { runsFromSessionEvents, eventsFromRuns } from '../src/observe.mjs';
+import { addSaw } from '../src/saw.mjs';
 
 export const TOOL_CURSOR_VERSION = 1;
+
+/**
+ * ★ 2026-11-02 小乔加（把 `src/saw.mjs` 真正接上）：
+ *
+ *   `saw.mjs` 写得很完整——166 行、34 条判据、负控制也验过——可它**从来没人调**。
+ *   `grep -rn "saw" plugin/` 一个都中不了。判据测的是它自己的纯函数，
+ *   测不到「它有没有真的被这个脑子用上」。这跟 README 第 30 条踩坑是同一类病：
+ *   **码写着、接口没人接、而且不报错。**
+ *
+ *   所以这里不是新造一块功能，是把它接到它本来就该在的那条线上：
+ *   她出门那一趟里，`tool/result` 成功落地的那一刻，就是一条「我亲手看过」。
+ *
+ * ★ 三条口径（跟 saw.mjs 的纪律对齐，这里只负责「喂对料」）：
+ *
+ *   ① 只认「看」的那几种。`read / write / edit / skill / lookup` 之外的工具
+ *      （跑命令、抓网页）在 run 上只有一个名字，没有 mount——**宁可不记**。
+ *      编一个 mount 出来就等于承认「我看过的东西我自己都说不出在哪」，那不是证据。
+ *   ② 只认成功的。失败的那条已经在 `observe()` 里记成「我用X没成」了，
+ *      再记一条「我看过」就等于把没看见的东西算成看见。
+ *   ③ `target` 是可选的：这次出门是为了哪条判断（`belief:<id>`）。
+ *      不知道就不填——`unverifiedOf()` 那边会把它当成「顺手看了一眼」，
+ *      宁可多跑一趟，也不假装看过了。
+ */
+export const SAW_TOOLS = Object.freeze(['read', 'write', 'edit', 'skill', 'lookup']);
+
+export function sawsFromRuns(runs, { target = null, at = Date.now() } = {}) {
+  const out = [];
+  for (const r of Array.isArray(runs) ? runs : []) {
+    if (!r || !r.ok) continue;
+    const kind = String(r.tool ?? '');
+    if (!SAW_TOOLS.includes(kind)) continue;
+    const callId = String(r.callId ?? '').trim();
+    out.push({
+      kind,
+      // mount 必须指向一个**能回去再找一次**的坐标。callId 就是那个坐标。
+      mount: callId ? `tool:${callId}` : '',
+      saw: `我自己动手${kind === 'read' ? '读了一遍' : kind === 'skill' ? '学会了一样本事' : '写成了一笔'}`,
+      target,
+      at: Number(r.at) || at,
+    });
+  }
+  return out;
+}
+
+/** 读一份 saw 账。坏文件一律当空——这一支是佐证，坏了不该拖垮主路径。 */
+export function readSaws(path) {
+  if (!path || !existsSync(path)) return [];
+  try {
+    const o = JSON.parse(readFileSync(path, 'utf8'));
+    return Array.isArray(o?.items) ? o.items : [];
+  } catch {
+    try { renameSync(path, `${path}.bad-${Date.now()}`); } catch { /* 备份不了也继续 */ }
+    return [];
+  }
+}
 
 function readAll(path) {
   if (!path || !existsSync(path)) return {};
@@ -95,26 +151,36 @@ function eventsOf(session) {
  * @param {number} [p.now]
  * @returns {{added:number, runs:number, cursor:number}}
  */
-export function observeTools({ session, mind, cursorPath, sessionId, duringAct = false, now = Date.now() } = {}) {
-  if (!session || !mind?.store?.observe || !sessionId) return { added: 0, runs: 0, cursor: 0 };
+export function observeTools({ session, mind, cursorPath, sessionId, duringAct = false, now = Date.now(), sawPath = null, target = null } = {}) {
+  if (!session || !mind?.store?.observe || !sessionId) return { added: 0, runs: 0, cursor: 0, saws: 0 };
   const all = eventsOf(session);
-  if (!all.length) return { added: 0, runs: 0, cursor: 0 };
+  if (!all.length) return { added: 0, runs: 0, cursor: 0, saws: 0 };
 
   const cursors = readAll(cursorPath);
   const prev = Number(cursors[sessionId] ?? 0);
 
   // 用 seq 当游标：宿主事件都有单调 seq
   const maxSeq = all.reduce((m, e) => Math.max(m, Number(e?.seq) || 0), 0);
-  if (maxSeq && maxSeq <= prev) return { added: 0, runs: 0, cursor: prev };
+  if (maxSeq && maxSeq <= prev) return { added: 0, runs: 0, cursor: prev, saws: 0 };
 
-  const runs = runsFromSessionEvents(all, { sinceSeq: prev });
+  // ★ 索引整段 events（不是片段）里的 tool/call —— 这是本跳唯一能拿全的地方。
+  //   `eventsFromRuns` 回头要用它补回「片段外那个 call」，否则工具名会退成 unknown。
+  const knownCalls = new Map();
+  for (const e of all) {
+    if (e?.type !== 'tool/call') continue;
+    const id = e.data?.callId;
+    if (!id) continue;
+    knownCalls.set(id, { tool: String(e.data?.name ?? 'unknown'), at: Number(e.at) || 0, seq: Number(e.seq) || 0 });
+  }
+
+  const runs = runsFromSessionEvents(all, { sinceSeq: prev, knownCalls });
   if (!runs.length) {
     // 没有可记的，但游标还是要走——否则下次会重复扫同一段
     if (maxSeq > prev) {
       cursors[sessionId] = maxSeq;
       writeAll(cursorPath, cursors);
     }
-    return { added: 0, runs: 0, cursor: maxSeq };
+    return { added: 0, runs: 0, cursor: maxSeq, saws: 0 };
   }
 
   const events = eventsFromRuns(runs, { duringAct, at: now });
@@ -124,12 +190,33 @@ export function observeTools({ session, mind, cursorPath, sessionId, duringAct =
     added += 1;
   }
 
+  // ★ 2026-11-02 小乔加：把「我亲手看过」也落一笔。
+  //   跟上面那条是**两本账**：上面记的是「我做过什么」（进判断/归纳的粮食），
+  //   这里记的是「我看过什么」（只给 verify 管，不进 Belief 库、不进 Event 流）。
+  //   只有 she 真的出门那一趟才写（duringAct）——她平常帮主人干活时读的文件不是「我的经历」。
+  let saws = 0;
+  if (duringAct && sawPath) {
+    const picked = sawsFromRuns(runs, { target, at: now });
+    if (picked.length) {
+      let list = readSaws(sawPath);
+      for (const s of picked) {
+        const before = list.length;
+        list = addSaw(list, s, { now });
+        if (list.length !== before) saws += 1;
+      }
+      try {
+        mkdirSync(dirname(sawPath), { recursive: true });
+        writeFileSync(sawPath, JSON.stringify({ version: 1, items: list }, null, 1), 'utf8');
+      } catch { /* 这一支写不进去，不拖垮上面那本账 */ }
+    }
+  }
+
   // ★ 写进去了才推游标（跟 digest-cursor 同一条纪律）
   if (maxSeq > prev) {
     cursors[sessionId] = maxSeq;
     writeAll(cursorPath, cursors);
   }
-  return { added, runs: runs.length, cursor: maxSeq };
+  return { added, runs: runs.length, cursor: maxSeq, saws };
 }
 
 export function defaultToolCursorPath(pluginRoot) {

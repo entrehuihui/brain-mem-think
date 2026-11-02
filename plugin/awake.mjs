@@ -35,7 +35,55 @@
 
 import { gate, hashSay } from '../src/wake.mjs';
 import { askSpeak } from '../src/speak.mjs';
+import { lookupLine } from '../src/lookup.mjs';
 import { readWake, writeWake } from './wake-store.mjs';
+
+/**
+ * ★ 2026-11-02 小乔加（`src/lookup.mjs` 落到实处）：
+ *
+ * 这个入口一直接不收人。`lookup.mjs` 写完、34 条判据全绿之后，
+ * `grep -rn "lookup" plugin/` 依旧是 0 —— 它被装好了，但**从来没被这个脑子叫过**。
+ *
+ * 接在这儿，是因为「想不起来就回去翻一次」跟「醒」是同一件事的两头：
+ * 醒来的时候她手上只有熔过的判断，被问住的时候（主人问了一件从没熔成判断的事）
+ * 她本该有话可说，可她没有。这条路就是那一下。
+ *
+ * 三条口径，全在**「不让它变回原文」**这一侧：
+ *
+ *  ① **只在「问」上有意义。** 她主动醒来、没有主人的新问题 → 根本不该翻。
+ *     一个人晚上躺床上忽然想起「他那天到底怎么说的」，这在她的结构里是假的
+ *     （她要么记得，要么不记得），翻出来就是自己给自己造事。
+ *  ② **翻不到就不摆。** `lookupLine()` 会给一句「翻了，没有找到」——那是诚实的，
+ *     但把它塞进「她主动开口」的素材里就成了「因为想不起来而开口」，反过来催她说话。
+ *     所以这里只取 `found:true` 那一条，`found:false` 直接不出声。
+ *  ③ **翻到了也要过 8 字闸。** 闸在 `shape()` 里，这里不重复实现——
+ *     这里只负责「把材料给它、把结果递出去」，判据只有一份。
+ *
+ * @param {object} p
+ * @param {object[]} p.materials 被遮蔽的归档材料（原文，只用来对照，不该外流）
+ * @param {string} p.question    此刻被问住的那句话（主人的原话）
+ * @param {Function} p.restate   重述器（一般就是宿主那个 llm 通路）
+ * @param {object} [p.opts]
+ * @returns {Promise<{found:boolean, line:string|null}>}
+ */
+export async function maybeLookup({ materials, question, restate, opts = {} } = {}) {
+  const q = String(question ?? '').trim();
+  const list = Array.isArray(materials) ? materials.filter(Boolean) : [];
+  // ① 没被问住，就没有「回去翻」这回事。
+  if (!q || !list.length || typeof restate !== 'function') return { found: false, line: null };
+  try {
+    const { lookup } = await import('../src/lookup.mjs');
+    const r = await lookup(q, list, restate, opts);
+    // ② 翻不到不出声：「我不知道」不该变成催她开口的理由。
+    if (!r?.found) return { found: false, line: null };
+    // ③ 翻到了——这句就是它唯一该出现的地方。
+    const lines = lookupLine(r);
+    return { found: true, line: lines[0] ?? null, gist: r.gist, mount: r.mount };
+  } catch {
+    // 这一支坏了不该拖垮「醒」——翻一次失败等于没翻。
+    return { found: false, line: null };
+  }
+}
 
 /**
  * 醒来一次，给一个决定。**不发送**——发送是 wake-exit 的事。
@@ -208,6 +256,30 @@ export async function planWake({ mind, state, now = Date.now(), cfg = {}, synth 
   }
   const world = (typeof mind?.world === 'function' ? mind.world({ name: cfg.name }) : '') || '';
   const sources = notes.map((n) => n?.note ?? n?.text ?? '').filter(Boolean);
+
+  // ★ 2026-11-02 小乔加：被问住的时候，允许回去翻一次。
+  //
+  //   只在**这一趟确实是「主人刚说过话、她被问住了」**时才翻。判据是调用方给的两样：
+  //     ctx.ownerAsk     主人最后那一句（原话）
+  //     ctx.archived     被遮蔽的归档材料（只用来对照 8 字闸，不外流）
+  //   两样缺一个就不翻——宁可少一次「想起来」，也不自己给自己造事。
+  //   翻到的结果走 note 追加给 askSpeak，她看不看得见、要不要说，仍旧由她自己定。
+  let lookupLine0 = null;
+  if (ctx?.ownerAsk && Array.isArray(ctx?.archived) && ctx.archived.length && cfg.lookup !== false) {
+    try {
+      const got = await maybeLookup({
+        materials: ctx.archived,
+        question: ctx.ownerAsk,
+        restate: (hit, mats) => (typeof mind?.restate === 'function'
+          ? mind.restate(hit, mats)
+          : ''),
+        opts: {},
+      });
+      if (got?.found && got.line) lookupLine0 = got.line;
+    } catch { /* 翻一次失败等于没翻，不该影响她说不说 */ }
+  }
+  if (lookupLine0) noteLines.push(`（${lookupLine0}）`);
+
   const v = await askSpeak({
     synth,
     world,
