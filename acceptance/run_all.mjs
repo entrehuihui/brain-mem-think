@@ -70,6 +70,14 @@ const SUITE = [
   // ★ 2026-10-30 加：主人问「meow-memory 会不会影响我这个插件」——
   //   别的插件塞进来的字（plugin:*、runtime-context…）一条都不许进熔炉。
   { key: 'v', file: 'acceptance/v_plugin_inject.mjs', title: '插件注入隔离（别家的字不许进熔炉）' },
+  // ★ 2026-11-02 我加的（不是主人设计的）：
+  //   原设计里 reconcile() 把 contested 记下来了，可 world.mjs 从来不读——
+  //   「我会顶嘴」这话说了不算数。现在把冲突摆进她睁眼看到的世界，
+  //   判据带负控制（故意改坏必须红），见 tests/smoke_doubt.mjs。
+  { key: 'w', file: 'tests/smoke_doubt.mjs', title: '我拿不准的事（contested 进世界·两边都在场·不裁决）' },
+  // ★ 2026-11-02 我加的：被问住的时候能回去查一次（只带回重述，8 字闸管着），
+  //   以及「我亲手看过」只认 read/run/fetch/look——说话和想事都不算证据。
+  { key: 'x', file: 'tests/smoke_lookup_saw.mjs', title: '回去查一次 + 我亲手看过（不存原文·说话不算证据）' },
   { key: 'r1', file: 'acceptance/redteam/r1_paraphrase_alive.mjs', title: '对抗·换皮冒充会想多' },
   { key: 'r2', file: 'acceptance/redteam/r2_correction_driven.mjs', title: '对抗·被纠正冒充会改自己' },
   { key: 'r3', file: 'acceptance/redteam/r3_curiosity_loop.mjs', title: '对抗·死循环冒充会追问' },

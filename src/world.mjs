@@ -19,6 +19,9 @@ import { clause, linesOf, toNote } from './flash.mjs';
 import { episodeLines } from './episode.mjs';
 import { weightWithSting } from './sting.mjs';
 import { recallFor } from './recall.mjs';
+// ★ 我加的（不是原设计）：把「我拿不准的事」接进她的世界。
+//   原设计里 contested 记了 but 没人读，等于「我会顶嘴」这话说了不算数。
+import { doubtsOf, doubtLines } from './doubt.mjs';
 
 export const WORLD_DEFAULTS = Object.freeze({
   // ★ 2026-10-27 大乔调（主人点破的：库里有 12 条现役，她只看得见一半）。
@@ -33,6 +36,10 @@ export const WORLD_DEFAULTS = Object.freeze({
   //   两条为限——再多，世界就变成流水账了。
   maxEpisodes: 2,
   episodes: [],
+  // ★ 我加的：一次对账结果。给了才摆「我拿不准的事」，不给就照旧——
+  //   老调用方一个字都不用改（跟 focus 当初的加法一个路子）。
+  reconcile: null,
+  maxDoubts: 3,
   // 名字从外面给（persona.name），不写死在代码里；不给就只写她记得的自己。
   name: null,
 });
@@ -222,6 +229,23 @@ export function renderWorld(beliefs, opts = {}) {
     lines.push('');
   }
 
+  // ★ 我加的：摆「我拿不准的事」。
+  //
+  //   位置是刻意选的——在「最近发生的事」之后、「我还记得这些」之前。
+  //   先有事情，再有我对这件事的两种说法，最后才是别的记忆。
+  //   摆到最前面她就像被劈头砸一记，摆到最后又像附录。
+  //
+  //   没给 apply 传 reconcile，或者对账里没有 contested，就整段不出现——
+  //   绝不补一句「我什么都没拿不准」：那是替她说了一句没根据的话。
+  const doubtList = o.reconcile
+    ? doubtsOf(notes, o.reconcile, { max: o.maxDoubts })
+    : [];
+  const doubtSeg = doubtLines(doubtList);
+  if (doubtSeg.length) {
+    for (const l of doubtSeg) lines.push(l);
+    lines.push('');
+  }
+
   // ★ 2026-10-27 大乔修（重复播报）：同一条判断既满足「关于我自己」，
   //   也排在「我还记得这些」里，于是她读到自己的同一句话两遍——
   //   实测渲染出来第一段和后面第一条一字不差。
@@ -261,6 +285,8 @@ export function renderWorld(beliefs, opts = {}) {
     seen,
     mood,
     recalled,
+    // ★ 我加的：她此刻拿不准的事（已成形，给看板 / 审计用）。
+    doubts: doubtList,
     lines,
     text: lines.join('\n'),
     // 供给 Surface：她这轮能看见的就是这些，别的都看不见。

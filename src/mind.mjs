@@ -33,6 +33,7 @@ import { ABANDON_REASON, createCuriosity } from './curiosity.mjs';
 import { createRevision } from './revision.mjs';
 import { createFlash, clause, toNote } from './flash.mjs';
 import { renderWorld } from './world.mjs';
+import { doubtsOf } from './doubt.mjs';
 import { digestSession as runDigest, commitDigest } from './digest-session.mjs';
 import { strengthOfBelief, strengthFromEvidence } from './strength.mjs';
 import { eventFromBelief, eventFromJson, makeEvent } from './event.mjs';
@@ -991,6 +992,32 @@ export class Mind {
     return { ...result, committed: true };
   }
 
+  /**
+   * ★ 我加的：她此刻拿不准的事。
+   *
+   *   不是「还有什么没想明白」（那是悬案），是「同一件事我手上两份说法」。
+   *   内核数出来的和库里记着的顶上了，两边都不许被静默吞掉。
+   *
+   *   对外给的是纯数据：{ id, mine, counted, because, beliefId }。
+   *   渲染成人话由 world.mjs 走 doubtLines()，这里不拼句子。
+   */
+  doubts(opts = {}) {
+    try {
+      const notes = this.store.all.map(toNote);
+      let recon = opts.reconcile ?? null;
+      // 没传就用当下的对账：数一遍、对一遍，不做别的。
+      if (!recon) {
+        try {
+          const induced = induce(this.store.events, opts.induct ?? {});
+          recon = reconcile(induced, this.store.all);
+        } catch { recon = null; }
+      }
+      return doubtsOf(notes, recon, { max: opts.max });
+    } catch {
+      return [];
+    }
+  }
+
   /** 她这一轮「看得见的世界」——只有她自己的判断和经历，没有被人的聊天记录。 */
   world(opts = {}) {
     try {
@@ -998,6 +1025,9 @@ export class Mind {
         name: this.personaName ?? '',
         episodes: this.episodes,
         now: this.now(),
+        // ★ 我加的：世界渲染时把「我拿不准的事」一起带上。
+        //   不传这一项，doubt 那一段就整段不出现（老行为）。
+        reconcile: opts.reconcile ?? this._reconForWorld(),
         ...opts,
       });
       // renderWorld 给的是 { seen, mood, recalled, lines, text, surface }，
@@ -1015,11 +1045,39 @@ export class Mind {
         name: this.personaName ?? '',
         episodes: this.episodes,
         now: this.now(),
+        // ★ 我加的：world() 和 worldLines() 必须看见同一份世界，
+        //   否则「她说了什么」和「她在面板上看见什么」会是两套。
+        reconcile: opts.reconcile ?? this._reconForWorld(),
         ...opts,
       });
       return Array.isArray(out?.surface) ? out.surface : [];
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * ★ 我加的：给世界用的那份对账结果（带短路缓存）。
+   *
+   *   为什么要缓存：一次 `world()` 里，`worldLines()` 很可能紧跟着被调，
+   *   `induce()` 要扫全量观测流。一模一样的数据扫两遍，
+   *   纯浪费，还多一处可能不一致的机会。
+   *
+   *   什么时候失效：只要观测流 / 判断库条数变了就重算。
+   *   用条数当指纹够用——它只增不减，比时间戳诚实。
+   */
+  _reconForWorld() {
+    try {
+      const fp = `${this.store.events.length}:${this.store.all.length}`;
+      if (this._reconFp === fp && this._recon) return this._recon;
+      const induced = induce(this.store.events, {});
+      const recon = reconcile(induced, this.store.all);
+      this._reconFp = fp;
+      this._recon = recon;
+      return recon;
+    } catch {
+      // 算不出来就当没对过账：宁可不摆，也不摆一份错的。
+      return null;
     }
   }
 
