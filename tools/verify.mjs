@@ -14,7 +14,7 @@
  * 不联网、不读写生产数据（只读 judgments.json 做渲染检查）。
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -124,7 +124,25 @@ console.log('\n[⑤] 遮蔽与并发闸的不变量');
   const p = planFullShadow([10, 11, 12, 13], new Map());
   ok('切法是「system 之后整段遮」', JSON.stringify(p?.shadow) === JSON.stringify([11, 12, 13]), JSON.stringify(p));
 
-  const src = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+  // ★ 2026-11-02 小乔改（判据跟着代码搬家）：
+  //
+  //   这三条原来只读 `plugin/index.mjs` 一个文件。可 2026-11-02 我把
+  //   「增量熔 + 整段遮蔽」那 217 行搬进了 `plugin/digest.mjs`——
+  //   **遮蔽调用和水位归零也跟着搬走了**，于是这三条当场由绿转红（56 → 54/2）。
+  //
+  //   空转的判据有两条假法，我这次两条都避开了：
+  //
+  //     ✗ 错法一：把搬家后的代码再复制一份回 index.mjs —— 两份真相，迟早对不上。
+  //     ✗ 错法二：把判据删掉或改成只扫 digest.mjs —— 以后谁在别处再开一处遮蔽，它就看不见了。
+  //     ✓ 对法：**判据的扫描面跟着真相走** —— 整个 plugin/ 一起扫，不认具体文件。
+  //
+  //   这跟 `i_single_exit` 那次是同一个毛病：判据守着某个**文件/目录**，
+  //   真相搬走了，它还在原地绿着（或者红着）。扫描面必须跟着真相走。
+  const pluginDir = join(ROOT, 'plugin');
+  const src = readdirSync(pluginDir)
+    .filter((f) => f.endsWith('.mjs'))
+    .map((f) => readFileSync(join(pluginDir, f), 'utf8'))
+    .join('\n');
 
   // ① 所有遮蔽调用都必须带 full:true（不许再回到「留最后几条」）
   const calls = [...src.matchAll(/compactChannel\([^)]*\)/g)].map((m) => m[0]);
@@ -133,7 +151,13 @@ console.log('\n[⑤] 遮蔽与并发闸的不变量');
   ok('遮蔽至少有一处真实调用', calls.length >= 2, 'calls=' + calls.length);
 
   // ② 熔成功后水位必须归零（否则遮掉之后旧水位会漏掉新话）
-  ok('熔成功后把水位归零', /if \(shadowed\) writeCursor\(cursorPath, CHANNEL_SESSION_ID, 0\)/.test(src));
+  //
+  // ★ 通道 id 现在在 digest.mjs 里写成局部常量 `CID`，不再是大写的全局名。
+  //   判据只认一种拼写，就是在认实现细节——改成盯「归零这件事」本身：
+  //   必须有一个 writeCursor(..., 0)，并且它跟 `if (shadowed)` 绑在一起。
+  //   换名字、换文件都还抓得住，但**把归零删掉一定红**。
+  ok('熔成功后把水位归零', /if \(shadowed\)\s+writeCursor\([^)]*,\s*0\)/.test(src)
+    || /if \(shadowed\)\s*\{[\s\S]{0,160}?writeCursor\([^)]*,\s*0\)/.test(src));
 
   // ③ 并发闸：成功返回也要复位 inFlight
   const tail = src.slice(src.indexOf('clearTimeout(hardTimer)'));
@@ -192,7 +216,24 @@ console.log('\n[⑦] 联想（旧事并置，不靠喂）');
   ok('带中文数字的句子不说', parseAssoc(JSON.stringify({ text: '我三次都是先紧后松，心里接得住', relation: 'can_stand', polarity: 'favorable' })) === null);
 
   const mindSrc = readFileSync(join(ROOT, 'src', 'mind.mjs'), 'utf8');
-  const plugSrc = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+  // ★ 2026-11-02 小乔改（判据不许认文件）：
+  //
+  //   `plugSrc` 原来只读 `plugin/index.mjs`。11-02 把 `tick` 搬进
+  //   `plugin/wake-loop.mjs` 之后，这两条**由绿转红**（56 → 54/2）——
+  //   可「tick 里真的会触发联想」这件事，一行都没变坏，它只是搬了个家。
+  //
+  //   这已经是同一天里第三次同款事故了：
+  //     · `i_single_exit` 默认只扫 src，而真出口在 plugin
+  //     · verify 的遮蔽三条只读 index.mjs，遮蔽代码搬走了
+  //     · 现在这两条同样只读一个文件
+  //
+  //   **判据一旦绑死文件名，重构就会把它冻住。** 所以统一改成扫整个 plugin/。
+  //   代价是慢一点（读十几个文件），换来的是搬家不动判据——这个价必须付。
+  const pluginDir = join(ROOT, 'plugin');
+  const plugSrc = readdirSync(pluginDir)
+    .filter((f) => f.endsWith('.mjs'))
+    .map((f) => readFileSync(join(pluginDir, f), 'utf8'))
+    .join('\n');
   ok('Mind.associate 接出来了', /async associate\(/.test(mindSrc));
   ok('联想的话要过 8 字抄原文闸', /longestSharedRun\(parsed\.text/.test(mindSrc));
   ok('对账四分类：confirmed/contested 都留痕', /contested|confirmed/.test(mindSrc.slice(mindSrc.indexOf('async associate('), mindSrc.indexOf('async associate(') + 4000)));
@@ -259,7 +300,9 @@ console.log('\n[⑨] 情境检索（3-5 条，不是全库）');
   const heldAll = beliefs.filter((b) => b.status === 'held');
   ok('没给情境：全部现役都看得见（兼容）', heldAll.every((b) => without.text.includes(b.text)));
 
-  const plugSrc2 = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+  // ★ 2026-11-02 小乔：同样不认文件——扫整个 plugin/。
+  const plugSrc2 = readdirSync(join(ROOT, 'plugin')).filter((f) => f.endsWith('.mjs'))
+    .map((f) => readFileSync(join(ROOT, 'plugin', f), 'utf8')).join(String.fromCharCode(10));
   ok('注入时真的传了当下情境', plugSrc2.includes('focus: currentFocus()'));
   ok('取不到情境时退回（不硬撑）', /const currentFocus = \(\) => [\s\S]{0,700}return null/.test(plugSrc2));
 }
@@ -268,7 +311,9 @@ console.log('\n[⑨] 情境检索（3-5 条，不是全库）');
 console.log('\n[⑩] 想不想做事（want）');
 {
   const awake = readFileSync(join(ROOT, 'plugin', 'awake.mjs'), 'utf8');
-  const plug = readFileSync(join(ROOT, 'plugin', 'index.mjs'), 'utf8');
+  // ★ 2026-11-02 小乔：同上，扫整个 plugin/。
+  const plug = readdirSync(join(ROOT, 'plugin')).filter((f) => f.endsWith('.mjs'))
+    .map((f) => readFileSync(join(ROOT, 'plugin', f), 'utf8')).join(String.fromCharCode(10));
   const mindS = readFileSync(join(ROOT, 'src', 'mind.mjs'), 'utf8');
   const speak = readFileSync(join(ROOT, 'src', 'speak.mjs'), 'utf8');
 

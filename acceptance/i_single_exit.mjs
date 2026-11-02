@@ -30,7 +30,28 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
 
-const DEFAULT_DIRS = ['src'];
+/**
+ * 默认扫哪些目录。
+ *
+ * ★ 2026-11-02 小乔改（判据原来只管住半个仓库）：
+ *
+ *   这里原来是 `['src']`。可**真正的出口在 `plugin/wake-exit.mjs`**——
+ *   `src/` 是纯脑子、不认宿主，它里头反而不该有出口。
+ *
+ *   于是这条判据守着的是一个**不存在出口的地方**：
+ *   你就算在 `plugin/` 里再开第二条出口，它照样是绿的。
+ *   实测把 plugin 加进来，立刻多抓出一处：
+ *
+ *     src/wake.mjs:406   await deps.followup(r.say)
+ *
+ *   那是个**从没被调用过的**死代码（`grep wakeOnce` 只有定义），
+ *   可它是一颗装好的雷：哪天有人顺手用了 wakeOnce，出口就静默地变成两条。
+ *   （已在内核里折成「决策 + 落账」，见 src/wake.mjs 的注释。）
+ *
+ *   现在两边都扫。**出口在哪儿就扫到哪儿**——判据的管辖范围必须跟着真相走，
+ *   不能跟着「哪个目录好扫」走。
+ */
+const DEFAULT_DIRS = ['plugin', 'src'];
 
 function listSources(dir) {
   const out = [];

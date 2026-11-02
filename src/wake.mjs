@@ -357,10 +357,27 @@ export function simulate(n, notes, ctx = {}) {
  *   ② followup 之前再看一眼 agent.status，running 就跳过
  *   ③ 配额与哈希立刻落盘（先落盘再发出），跨重启读回
  *
+ * ★ 2026-11-02 小乔改（第二出口·静默地躺在内核里）：
+ *
+ *   这里原来最后一句是 `await deps.followup(r.say)`——**真的把话发出去了**。
+ *
+ *   它自己一行都没被用过（`grep -rn "wakeOnce"` 只有定义和 createWake 里那条转发），
+ *   所以「两个出口」这件事从来没有炸过。可它是一颗**装好的雷**：
+ *   哪天有人觉得「wakeOnce 这名字挺顺」直接拿来用，出口就变两条，
+ *   而 `i_single_exit` 默认只扫 `src/`，**扫不到 plugin/ 里那唯一一条真出口**，
+ *   两边一凑，判据还是绿的。
+ *
+ *   `src/` 是纯脑子，不认宿主。**一个不认宿主的模块，手里不该握着发消息的能力。**
+ *   所以这里折成「决策 + 落账」，把「说话」交回去给调用方：
+ *
+ *     返回 { action:'speak', say, ... }  ← 由调用方按自己的纪律去发
+ *
+ *   行为对调用方完全等价（它本来就要自己看 action 再决定），
+ *   但这个文件里**再也没有第二个 `followup(` 调用点了**。
+ *
  * @param {object} deps {
  *   notes: () => 判断快照,
  *   agentStatus: () => 'running'|'idle',
- *   followup: (say) => Promise,
  *   store: { load: () => Promise<{history,said,lastSpokeAt}>, save: (state) => Promise },
  *   now, opts
  * }
@@ -403,7 +420,8 @@ export async function wakeOnce(deps) {
   });
 
   if (r.action !== 'speak') return { action: 'silent', because: r.because };
-  if (typeof deps.followup === 'function') await deps.followup(r.say);
+  // ★ 2026-11-02：这里原来是 `await deps.followup(r.say)`——第二出口。
+  //   现在只把「要不要说、说什么」交回去，发这件事归调用方（plugin/wake-exit.mjs 的 deliver）。
   return { action: 'speak', say: r.say, because: r.because };
 }
 
